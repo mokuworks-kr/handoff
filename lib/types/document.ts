@@ -46,6 +46,15 @@
  *    Illustrator는 keepWithNext, hyphenation 등 일부 ParagraphStyle 옵션을
  *    지원하지 않는다. 어댑터는 표현 가능한 부분만 매핑하고 나머지는 무시
  *    또는 인라인 오버라이드로 흡수한다.
+ *
+ * 7) 콤포지션 슬러그는 식별자, Source of Truth는 frames[] (M2.5 추가)
+ *    Page.composition 은 "이 페이지가 어떤 콤포지션 패턴으로 짜였는지"의
+ *    식별자다. 좌표·크기 등 실제 레이아웃은 Page.frames[] 에 mm 단위로 박혀 있고,
+ *    composition 슬러그가 바뀐다고 frames[] 가 자동으로 재생성되지 않는다.
+ *    composition은 디버깅·자연어 수정 라우팅("이 페이지를 다른 콤포지션으로")·
+ *    통계 집계의 키로만 쓴다.
+ *    그리드 어휘(DesignTokens.gridVocabulary) 자체는 frames 좌표에 영향을 주지
+ *    않는다 — LLM이 비율을 고를 때만 참조하는 책 단위 화이트리스트일 뿐.
  */
 
 import type { DesignTokens } from "./design-tokens";
@@ -138,8 +147,22 @@ export type Page = {
   id: string;
   /** 좌/우 페이지 (좌우 미러링 마진 적용용) */
   side: "left" | "right";
-  /** 페이지 템플릿 슬러그 (lib/layout/templates/) */
-  template: string;
+  /**
+   * 콤포지션 슬러그 — 이 페이지가 어느 콤포지션 패턴으로 짜였는지.
+   *
+   * (M2.5에서 `template`에서 `composition`으로 리네임. 이름이 박제 템플릿을
+   * 시사해 위험했다. §11 결정 — "템플릿 30개 시스템"이라는 표현 폐기.)
+   *
+   * 페이지네이션 LLM은 DesignTokens.gridVocabulary 안의 비율 중 하나를 골라
+   * 콤포지션을 짜며, 그 결과를 식별할 슬러그를 여기 박는다.
+   * 예: "body-12", "split-6-6", "split-8-4-image-left" 등.
+   *
+   * 슬러그 명명 규칙은 lib/layout/composition.ts 에서 다룬다.
+   * 이 필드는 Source of Truth가 아니라 *식별자*다 — 실제 좌표는
+   * frames[]에 mm 단위로 박혀 있고, composition은 디버깅·자연어 수정·
+   * 통계 집계의 키로만 쓰인다.
+   */
+  composition: string;
   frames: Frame[];
 
   /** 적용할 마스터 페이지 ID */
