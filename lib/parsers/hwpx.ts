@@ -229,85 +229,111 @@ function sectionToBlocks(
   const sec = parsed?.["hs:sec"];
   if (!sec) return out;
 
-  // 섹션 안의 자식 — hp:p 와 hp:tbl 등이 섞일 수 있음.
-  // fast-xml-parser는 자식 태그 등장 순서를 보존하지 않아 hp:p[]와 hp:tbl[] 가
-  // 별도 배열로 들어감 → 시각적 순서가 어긋남.
+  // OWPML 구조 (실측):
+  //   hs:sec
+  //     hp:p              ← 단락
+  //       hp:run          ← run (스타일 적용 범위)
+  //         hp:t            ← 텍스트
+  //         hp:tbl          ← 표 (인라인 임베드 객체!)
+  //         hp:pic          ← 이미지 (인라인 임베드)
+  //         hp:ctrl         ← 컨트롤 (각주, 페이지번호 등)
+  //       hp:linesegarray ← 줄 분할 정보 (시각용, 무시)
   //
-  // 대부분의 회사소개서/IR 시나리오에서 표는 본문 마지막 또는 특정 위치에 1~2개라
-  // 1차에서는 "단락들 다음에 표들" 순서로 평탄화. 분류기가 흡수.
-  // 100% 시각적 순서가 필요하면 raw XML을 정규식으로 순회하는 방식 추가.
+  // 즉 표/이미지는 sec의 직접 자식이 아니라 hp:p > hp:run 안에 들어있다.
+  // 한 단락에 여러 run이 있고, run 하나에 텍스트와 표가 섞일 수도 있다.
+  // 단락 순서를 보존하기 위해 단락 단위로 처리하면서 안의 run을 차례로 본다.
 
-  // 단락들
   const paragraphs: any[] = sec["hp:p"] ?? [];
+
   for (const p of paragraphs) {
     // pageBreak="1" 단락은 페이지 분리 신호
     if (p["@_hp:pageBreak"] === "1") {
       out.push({ id: nextId(), type: "separator", kind: "page" });
     }
 
-    const runs = collectRuns(p, charPrMap);
-    const text = runs.map((r) => r.text).join("").trim();
-    if (text.length === 0) {
-      // 빈 단락은 hwpx의 빈 줄 표현 — 버림
-      continue;
+    // 한 단락 안에서 run을 순서대로 처리:
+    //   - hp:tbl 발견 → TableBlock 출력
+    //   - hp:pic 발견 → ImageBlock placeholder 출력
+    //   - hp:t 텍스트 → 누적해서 마지막에 ParagraphBlock 출력
+    //
+    // 이렇게 하면 한 단락 안에 [텍스트] [표] [텍스트] 순서가 있어도 보존됨.
+    const runs: any[] = p["hp:run"] ?? [];
+    let pendingTextRuns: TextRun[] = [];
+
+    const flushPending = () => {
+      const text = pendingTextRuns.map((r) => r.text).join("").trim();
+      if (text.length === 0) {
+        pendingTextRuns = [];
+        return;
+      }
+      out.push({
+        id: nextId(),
+        type: "paragraph",
+        runs: pendingTextRuns,
+        sourceLocation: `hwpx:s${sectionNumber}`,
+      });
+      pendingTextRuns = [];
+    };
+
+    for (const r of runs) {
+      // 텍스트 추출
+      const t = extractRunText(r);
+      if (t.length > 0) {
+        const charPrId = r["@_hp:charPrIDRef"];
+        const style = (typeof charPrId === "string" ? charPrMap.get(charPrId) : undefined) ?? {
+          bold: false,
+          italic: false,
+          underline: false,
+        };
+        pendingTextRuns.push({
+          text: t,
+          ...(style.bold ? { bold: true } : {}),
+          ...(style.italic ? { italic: true } : {}),
+          ...(style.underline ? { underline: true } : {}),
+        });
+      }
+
+      // 표 — run에 임베드되어 있을 수 있음. 한 run에 여러 표가 있을 가능성도 대비.
+      const tbls: any[] = r["hp:tbl"] ?? [];
+      for (const tbl of tbls) {
+        // 표 직전에 누적된 텍스트가 있으면 먼저 출력
+        flushPending();
+        const block = tableToBlock(tbl, nextId, sectionNumber, charPrMap);
+        if (block) out.push(block);
+      }
+
+      // 이미지 — 마찬가지로 인라인 임베드
+      const pics: any[] = r["hp:pic"] ?? [];
+      for (const _pic of pics) {
+        flushPending();
+        out.push({
+          id: nextId(),
+          type: "image",
+          alt: "",
+          originalSrc: "(embedded)",
+          sourceLocation: `hwpx:s${sectionNumber}`,
+        });
+      }
     }
 
-    out.push({
-      id: nextId(),
-      type: "paragraph",
-      runs,
-      sourceLocation: `hwpx:s${sectionNumber}`,
-    });
-  }
-
-  // 표들 — 단락 다음에 출력
-  const tables: any[] = sec["hp:tbl"] ?? [];
-  for (const tbl of tables) {
-    const block = tableToBlock(tbl, nextId, sectionNumber, charPrMap);
-    if (block) out.push(block);
+    // 단락 끝 — 남은 텍스트 출력
+    flushPending();
   }
 
   return out;
 }
 
 /**
- * 단락 안의 hp:run들을 순회해 TextRun[].
- *
- * 각 run의 charPrIDRef를 charPrMap에서 조회해 bold/italic/underline 결정.
+ * run 객체에서 hp:t 텍스트만 추출.
+ * (이전엔 collectRuns 안에 있었지만, 이제 텍스트와 임베드 객체를 분리 처리해야 해서 별도 함수)
  */
-function collectRuns(p: any, charPrMap: Map<string, CharStyle>): TextRun[] {
-  const runs: any[] = p["hp:run"] ?? [];
-  const out: TextRun[] = [];
-
-  for (const r of runs) {
-    const tValue = r["hp:t"];
-    let text: string;
-    if (typeof tValue === "string") {
-      text = tValue;
-    } else if (tValue && typeof tValue === "object" && "#text" in tValue) {
-      text = String(tValue["#text"]);
-    } else {
-      // <hp:t/> 빈 태그 케이스 — 텍스트 없음
-      continue;
-    }
-    if (text.length === 0) continue;
-
-    const charPrId = r["@_hp:charPrIDRef"];
-    const style = (typeof charPrId === "string" ? charPrMap.get(charPrId) : undefined) ?? {
-      bold: false,
-      italic: false,
-      underline: false,
-    };
-
-    out.push({
-      text,
-      ...(style.bold ? { bold: true } : {}),
-      ...(style.italic ? { italic: true } : {}),
-      ...(style.underline ? { underline: true } : {}),
-    });
+function extractRunText(r: any): string {
+  const tValue = r["hp:t"];
+  if (typeof tValue === "string") return tValue;
+  if (tValue && typeof tValue === "object" && "#text" in tValue) {
+    return String(tValue["#text"]);
   }
-
-  return out;
+  return "";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -375,15 +401,19 @@ function tableToBlock(
  * (NormalizedManuscript 결정 3 — 셀 = 단순 문자열)
  *
  * 셀 안의 인라인 스타일은 1차에서 버림 (회사소개서/IR 표는 평문 절대다수).
+ * 셀 안에 또 표가 중첩될 수 있지만 1차에서 무시 (재귀 평탄화 안 함).
  */
-function cellToText(tc: any, charPrMap: Map<string, CharStyle>): string {
+function cellToText(tc: any, _charPrMap: Map<string, CharStyle>): string {
   const subLists: any[] = tc["hp:subList"] ?? [];
   const lines: string[] = [];
   for (const subList of subLists) {
     const ps: any[] = subList["hp:p"] ?? [];
     for (const p of ps) {
-      const runs = collectRuns(p, charPrMap);
-      const text = runs.map((r) => r.text).join("");
+      const runs: any[] = p["hp:run"] ?? [];
+      let text = "";
+      for (const r of runs) {
+        text += extractRunText(r);
+      }
       if (text.length > 0) lines.push(text);
     }
   }
