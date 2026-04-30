@@ -227,9 +227,22 @@ function slideToBlocks(
 /**
  * 슬라이드 내 sp 배열 인덱스 중 어느 것을 heading으로 볼지.
  * -1 이면 heading 없음.
+ *
+ * 결정 순서:
+ *   (a) placeholder type="title" / "ctrTitle" — pptx의 명시적 제목 표시 (가장 강한 신호)
+ *   (b) 폰트 크기 sz가 ≥ 24pt (2400) 이고 짧고 종결부호 없음 — sz가 sp에 직접 박혀있을 때
+ *   (c) (b) 가 못 잡으면 (sz가 없거나, 있어도 모두 24pt 미만) — 첫 sp의 첫 단락이
+ *       짧고(≤60자) 종결부호 없으면 H 후보로
+ *   (d) 그래도 없으면 H 없음 (분류기 위임)
+ *
+ * (c) fallback이 필요한 이유: 잘 디자인된 pptx는 텍스트 박스에 sz를 직접 박지 않고
+ * 슬라이드 마스터/레이아웃에서 상속받는다. 그리고 본문이 작은 슬라이드(연혁 등)에서는
+ * sz가 있어도 24pt 미만일 수 있다. 마스터/레이아웃 inherit chain 추적은 비용이 크므로
+ * (c) 휴리스틱으로 대체.
  */
 function pickHeadingShapeIndex(spTree: any): number {
   const sps: any[] = spTree["p:sp"] ?? [];
+  if (sps.length === 0) return -1;
 
   // (a) placeholder type="title" / "ctrTitle" 우선
   for (let i = 0; i < sps.length; i++) {
@@ -242,7 +255,7 @@ function pickHeadingShapeIndex(spTree: any): number {
     }
   }
 
-  // (b) 가장 큰 폰트 크기 (첫 단락 기준) 가진 박스, 그리고 그 크기가 ≥ 2400 (24pt)
+  // (b) 가장 큰 폰트 크기 (첫 단락 기준) 가진 박스, ≥ 24pt
   let bestIdx = -1;
   let bestSz = 0;
   for (let i = 0; i < sps.length; i++) {
@@ -252,16 +265,29 @@ function pickHeadingShapeIndex(spTree: any): number {
       bestIdx = i;
     }
   }
-  // 본문이 너무 작으면(< 24pt) heading 후보 없음
-  if (bestSz < 2400) return -1;
+  if (bestSz >= 2400 && bestIdx >= 0) {
+    const firstText = firstParagraphPlainText(sps[bestIdx]);
+    if (firstText.trim().length <= 60 && !/[.!?。!?]\s*$/.test(firstText.trim())) {
+      return bestIdx;
+    }
+  }
 
-  // 박스 첫 단락 텍스트가 너무 길면 본문 가능성이 큼 → 제외
-  const firstText = firstParagraphPlainText(sps[bestIdx]);
-  if (firstText.length > 60) return -1;
-  // 종결부호로 끝나면 본문
-  if (/[.!?。!?]\s*$/.test(firstText.trim())) return -1;
+  // (c) (b) 가 못 잡았을 때 fallback 휴리스틱
+  // sz 정보가 없거나(테마 상속 케이스) 모두 24pt 미만(본문이 작은 슬라이드)일 때
+  // 첫 sp의 첫 단락이 짧고 종결부호 없으면 H 후보
+  for (let i = 0; i < sps.length; i++) {
+    const text = firstParagraphPlainText(sps[i]).trim();
+    if (text.length === 0) continue;
+    if (text.length <= 60 && !/[.!?。!?]\s*$/.test(text)) {
+      return i;
+    }
+    // 첫 텍스트가 있는 박스가 H 조건을 못 채우면 그 슬라이드는 H 없음.
+    // (다른 박스를 더 보지 않음 — 보통 슬라이드 제목은 첫 박스에 있고,
+    // 거기서 못 잡으면 다른 박스에서 잡는 건 false positive 위험이 더 큼)
+    return -1;
+  }
 
-  return bestIdx;
+  return -1;
 }
 
 /** 박스의 첫 비어있지 않은 단락에서 가장 큰 a:rPr/@sz 값 (pptx의 sz는 1/100 pt) */
