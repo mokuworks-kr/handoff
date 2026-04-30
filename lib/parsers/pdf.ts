@@ -168,7 +168,7 @@ function pageTextToBlocks(
   // 줄 단위로 끊기. 빈 줄은 무시 (의미 없음 — pdf-parse가 가끔 만들어내는 것일 뿐)
   const lines = normalized
     .split("\n")
-    .map((l) => l.trim())
+    .map((l) => cleanLine(l))
     .filter((l) => l.length > 0);
 
   // 영문 word-wrap 합침 처리
@@ -187,12 +187,63 @@ function pageTextToBlocks(
 }
 
 /**
+ * 줄 단위 정제.
+ *
+ * 디자인된 PDF는 폰트 매핑이 깨져 의미 없는 글리프가 박혀 들어온다.
+ * 텍스트 추출의 본질적 한계라 우리 파서가 완전히 고칠 수는 없지만,
+ * 패턴이 일정한 "알려진 깨짐"은 후처리로 수정한다. 분류기의 노이즈를 줄이는 게 목적.
+ *
+ * §1 약속(원고 안 다듬음) 위배 아님 — "원고 변경"이 아니라 "렌더링 오류 수정".
+ *
+ * 처리:
+ *   1) 제어문자(C0/C1) + PUA(U+E000~U+F8FF) 제거 — 의미 없는 아이콘 자리
+ *   2) 알려진 깨진 글리프 매핑 (디노티시아 브로슈어 검증으로 확인된 패턴):
+ *        é → •     (불릿)
+ *        Ç → :     (콜론)
+ *        ¦ → -     (하이픈)
+ *        \b → →    (화살표)
+ *      이 매핑은 디자인 폰트 따라 다를 수 있어 "1차 시드" 케이스 대응만.
+ *      다른 깨짐 패턴이 발견되면 여기 추가.
+ *   3) 정제 후 빈 문자열이거나 공백만이면 빈 줄로 (호출자가 필터)
+ *
+ * 트리밍은 안 함 — 줄 끝/시작 공백을 보존해야 word-wrap 합침이 정확하게 동작.
+ * 단 결과가 모두 공백이면 빈 줄로 버림.
+ */
+function cleanLine(line: string): string {
+  let s = line;
+
+  // 알려진 깨진 글리프 → 의미 글리프 (1대1 치환)
+  // 매핑 테이블이 길어지면 별도 상수로 분리
+  s = s.replace(/é/g, "•");
+  s = s.replace(/Ç/g, ":");
+  s = s.replace(/¦/g, "-");
+  s = s.replace(/\u0008/g, "→"); // \b
+
+  // C0 제어문자 (U+0000-U+001F, \t와 \n 제외) 제거
+  // \t는 보존 (탭으로 정렬된 텍스트), \n은 이미 split됨
+  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+
+  // C1 제어문자 (U+0080-U+009F) 제거 — 깨진 매핑의 잔재
+  s = s.replace(/[\u0080-\u009F]/g, "");
+
+  // PUA (U+E000-U+F8FF) 제거 — 폰트 회사 정의 사설 글리프 (로고 등). 의미 없음.
+  s = s.replace(/[\uE000-\uF8FF]/g, "");
+
+  const trimmed = s.trim();
+  return trimmed.length === 0 ? "" : s;
+}
+
+/**
  * 영문 word-wrap만 합치고, 그 외는 그대로.
  * "exam-\nple" → "example"
+ *
+ * 입력 lines는 양 끝 공백을 정리하지 않은 상태일 수 있으므로 내부에서 trim.
  */
 function mergeWordWrappedLines(lines: string[]): string[] {
   const out: string[] = [];
-  for (const line of lines) {
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.length === 0) continue;
     const last = out[out.length - 1];
     if (last && last.endsWith("-") && /^[a-z]/.test(line)) {
       out[out.length - 1] = last.slice(0, -1) + line;
