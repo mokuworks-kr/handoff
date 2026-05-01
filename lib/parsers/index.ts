@@ -23,6 +23,18 @@
  *
  * 4) `.hwp` (옛날 한컴 바이너리) → 명확한 에러:
  *    "지원하지 않는 형식입니다. 한컴오피스에서 .hwpx로 저장 후 다시 시도해주세요."
+ *
+ * ─────────────────────────────────────────────────────────────
+ * 동적 import — pdf 파서만
+ * ─────────────────────────────────────────────────────────────
+ *
+ * pdf-parse@2 가 내부적으로 pdfjs-dist를 쓰는데, pdfjs-dist는 브라우저용이라
+ * Vercel serverless 환경에서 모듈 로딩 시점부터 깨진다 (DOMMatrix 미정의 등).
+ * 라우트 모듈 전체가 깨져 docx/pptx/hwpx 까지 못 돌아가는 사고를 막기 위해
+ * pdf 케이스에서만 dynamic import로 격리.
+ *
+ * pdf 파서 라이브러리 자체 교체는 별도 작업 (M3a-2 후속).
+ * 그때까지 PDF 업로드는 실패하지만 다른 3개 형식은 정상 동작.
  */
 
 import {
@@ -32,7 +44,6 @@ import {
   type NormalizedManuscript,
 } from "./normalized";
 import { parseDocx } from "./docx";
-import { parsePdf } from "./pdf";
 import { parsePptx } from "./pptx";
 import { parseHwpx } from "./hwpx";
 
@@ -75,9 +86,13 @@ export async function parseManuscript(input: ParseInput): Promise<NormalizedManu
     case "docx":
       result = await parseDocx({ buffer, filename: input.filename });
       break;
-    case "pdf":
+    case "pdf": {
+      // dynamic import — pdf-parse의 무거운 의존성을 라우트 로딩 시점에서 격리.
+      // 이 케이스에서만 pdf 코드 + pdfjs-dist 평가됨.
+      const { parsePdf } = await import("./pdf");
       result = await parsePdf({ buffer, filename: input.filename });
       break;
+    }
     case "pptx":
       result = await parsePptx({ buffer, filename: input.filename });
       break;
@@ -174,13 +189,7 @@ async function detectFormat(
  * ZIP 파일 안을 들여다보고 docx/pptx/hwpx 구분.
  *
  * 라이브러리(JSZip 등)를 부르면 무겁고 비동기. 우리는 ZIP 헤더를 직접 읽어
- * 첫 몇 개 파일 이름만 본다. ZIP 헤더 구조 (Local File Header):
- *   offset 0  : 4 bytes signature "PK\x03\x04"
- *   offset 26 : 2 bytes file name length
- *   offset 30 : N bytes file name (UTF-8)
- *   ... (compressed data, then next entry)
- *
- * 처음 ~10개 entry만 읽고 판단. 모든 OOXML 형식이 첫 ~5개 안에 식별 파일을 가진다.
+ * 첫 몇 개 파일 이름만 본다.
  */
 async function detectZipFormat(buffer: Buffer): Promise<DetectedFormat> {
   const fileNames: string[] = [];
@@ -188,7 +197,6 @@ async function detectZipFormat(buffer: Buffer): Promise<DetectedFormat> {
   const maxEntries = 20;
 
   while (offset + 30 < buffer.length && fileNames.length < maxEntries) {
-    // Local File Header signature 확인
     if (
       buffer[offset] !== 0x50 ||
       buffer[offset + 1] !== 0x4b ||
@@ -213,14 +221,6 @@ async function detectZipFormat(buffer: Buffer): Promise<DetectedFormat> {
 
     offset += 30 + fileNameLength + extraFieldLength + compressedSize;
   }
-
-  // 판별 우선순위:
-  //   1) hwpx — 첫 파일이 mimetype (OWPML 표준 + 시드/실제 모두 확인됨)
-  //   2) docx — word/document.xml 존재
-  //   3) pptx — ppt/presentation.xml 존재
-  //
-  // hwpx가 mimetype 검사를 먼저 하는 이유: hwpx는 [Content_Types].xml 도 있을 수 있고
-  // (확장 포맷의 경우) 헷갈릴 여지가 있어, 가장 명확한 시그니처(mimetype 첫 파일)를 우선.
 
   if (fileNames[0] === "mimetype") {
     return "hwpx";
@@ -262,9 +262,6 @@ function formatFromExtension(filename: string): DetectedFormat | null {
  *   - heading 추정 안 함 (워드에서 복사하면 heading 정보가 없음 — 분류기 위임)
  *   - 인라인 스타일 없음 (평문이라)
  *   - 표/리스트 안 만듦 (평문에서 추정 어려움)
- *
- * 사용자가 "워드 본문을 통째로 복붙" 하는 시나리오를 받기 위함.
- * 표 같은 구조가 필요하면 원본 docx 업로드 권장 — 미리보기 UI에서 안내.
  */
 function parseText(content: string, filename: string): NormalizedManuscript {
   // \r\n → \n 정규화
@@ -279,7 +276,6 @@ function parseText(content: string, filename: string): NormalizedManuscript {
   const blocks: Block[] = [];
   let counter = 0;
   for (const para of paragraphs) {
-    // 단락 안의 줄바꿈은 공백 1개로 (CJK든 영문이든 동일 — 평문이라 정확한 추정 불가)
     const merged = para.replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
     if (merged.length === 0) continue;
     blocks.push({
