@@ -333,11 +333,12 @@ function expandSectionIdsToSlots(
     const matchingBlocks: string[] = [];
 
     if (slotKind === "text") {
-      // text 슬롯 — heading/paragraph/list 모두 박음 (블록 ID 순서)
+      // 1차 검증 단계 정책 (M3b-3 P11): text 슬롯에 모든 비-separator 블록을 박음.
+      // heading/paragraph/list 만 박으면 같은 섹션의 table/image 가 BLOCK_ORPHANED 로 누락됨
+      // (P10 결과). 1차는 lab end-to-end 흐름 통과가 본질이므로 시각적 정확성보다
+      // 누락 없는 통과 우선. M2 본격 디자인 작업 시 다시 엄격하게.
       for (const b of collectedBlocks) {
-        if (b.type === "heading" || b.type === "paragraph" || b.type === "list") {
-          matchingBlocks.push(b.id);
-        }
+        matchingBlocks.push(b.id);
       }
     } else if (slotKind === "image") {
       // image 슬롯 — 첫 image 블록만 (image 슬롯은 1개 블록 정책)
