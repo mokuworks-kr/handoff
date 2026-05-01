@@ -164,12 +164,27 @@ function inferPatternRatio(pattern: CompositionPattern): number[] {
 // ─────────────────────────────────────────────────────────────
 
 /**
+ * 1차 검증 단계 (M3b-3) 비활성 콤포지션 화이트리스트.
+ *
+ * lab end-to-end 흐름 통과를 위해 1차에서 일시적으로 카탈로그에서 제외:
+ *   - full-image: image 슬롯 1개. 이미지 없는 섹션을 LLM 이 잘못 매핑하는 사례
+ *     (P10 결과에서 확인). 1차에선 어휘를 [12] 단일·full-text 1개로 좁혀
+ *     "어떤 매니스크립트든 동작" 보장.
+ *
+ * 부활 조건: M2 본격 디자인 작업 + 다중 슬롯 어휘 활성화 + LLM 의 콤포지션
+ * 선택 정확도 검증된 후. 카탈로그 자체는 ALL_PATTERNS 그대로 — 미래 부활 즉시.
+ */
+const PHASE_1_DISABLED_SLUGS: ReadonlySet<string> = new Set([
+  "full-image",
+]);
+
+/**
  * 어휘 기반 1차 좁히기 (§16.6).
  *
  * 책 단위로 한 번 부름 — 페이지네이션 LLM 호출 직전.
  *
  * @param vocabulary  DesignTokens.gridVocabulary 그대로
- * @returns 어휘에 등장하는 비율과 매칭되는 콤포지션들
+ * @returns 어휘에 등장하는 비율과 매칭되는 콤포지션들 (1차 비활성 제외)
  *
  * 예:
  *   getPatternsForVocabulary([[12], [6,6], [8,4], [4,4,4], [3,3,3,3]])
@@ -177,6 +192,9 @@ function inferPatternRatio(pattern: CompositionPattern): number[] {
  *
  *   getPatternsForVocabulary([[12], [6,6]])
  *     → 4개 (full-text, full-image, halves-text-text, halves-text-image)
+ *
+ *   getPatternsForVocabulary([[12]])
+ *     → 1개 (full-text). full-image 는 1차 검증 단계 비활성 (위 PHASE_1_DISABLED_SLUGS).
  *
  * 어휘에 매칭되는 패턴이 0개인 비율이 있으면 콘솔 경고.
  */
@@ -187,6 +205,7 @@ export function getPatternsForVocabulary(
 
   const matched: CompositionPattern[] = [];
   for (const pattern of ALL_PATTERNS) {
+    if (PHASE_1_DISABLED_SLUGS.has(pattern.slug)) continue;
     const ratio = inferPatternRatio(pattern);
     const key = normalizeVocabularyRatio(ratio);
     if (allowedKeys.has(key)) {
