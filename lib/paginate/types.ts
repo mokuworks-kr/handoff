@@ -113,9 +113,14 @@ export type LlmPageOutput = {
 export type LlmBookOutput = {
   pages: LlmPageOutput[];
   /**
-   * LLM 이 의도적으로 누락한 블록 + 사유.
-   * §1 약속 강제: 침묵 누락은 검증 실패, 명시적 누락만 허용.
-   * 예: [{ blockIds: ["b0099"], reason: "보고서 부록이라 본문에서 제외" }]
+   * @deprecated 1차 검증 단계 (M3b-3 P9) 에서 tool schema 에서 제거됨.
+   * LLM 이 출력하지 않음. 타입은 호환성을 위해 보존 (UI 컴포넌트가 옵셔널 참조).
+   *
+   * 부활 조건: 다중 슬롯 어휘 본격 도입 + retry-with-feedback 으로 LLM 의 잘못된
+   * intentionalOmissions 사용 (모든 블록을 여기로 밀어넣는 패턴) 을 교정 가능해진 후.
+   *
+   * 검증 코드도 이 필드 사용 안 함. validateBlockUsage 가 separator 블록을 자동 제외
+   * 처리하므로 1차에서는 escape hatch 가 필요 없음.
    */
   intentionalOmissions?: Array<{
     blockIds: string[];
