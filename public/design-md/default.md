@@ -2,6 +2,9 @@
 slug: default
 name: Default
 description: 기준 디자인. 무채색·미니멀·차분한 호흡. 모든 새 스타일의 복제 시드.
+version: 1.0.0
+author: handoff-builtin
+license: MIT
 ---
 
 # 1. Identity
