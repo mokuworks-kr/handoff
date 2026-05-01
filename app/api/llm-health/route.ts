@@ -1,10 +1,3 @@
-// 기존 import 아래에
-export const maxDuration = 30;
-export const runtime = "nodejs";
-
-export async function GET(request: NextRequest) {
-  // ... 기존 그대로
-}
 
 /**
  * LLM 헬스체크 — API 키 살아있고 호출 성공하는지.
@@ -23,9 +16,12 @@ export async function GET(request: NextRequest) {
  * 보안: API 키는 응답에 절대 노출 X.
  */
 
+
+
 import { NextResponse, type NextRequest } from "next/server";
 import { callTool, LlmCallError, LLM_PROVIDERS, type LlmProvider } from "@/lib/llm";
-
+export const maxDuration = 30;
+export const runtime = "nodejs";
 export async function GET(request: NextRequest) {
   // ?provider= 쿼리 파라미터
   const url = new URL(request.url);
