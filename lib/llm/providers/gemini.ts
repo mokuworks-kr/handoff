@@ -6,9 +6,10 @@
  * 책임:
  *   1) Gemini API 호출 (ai.models.generateContent)
  *   2) FunctionCallingConfigMode.ANY 로 tool 호출 강제
- *   3) 재시도 (3회 exp backoff)
- *   4) 에러를 LlmCallError로 통일
- *   5) 토큰/비용 추적
+ *   3) thinking 비활성화 (분류 작업은 reasoning 불필요, MAX_TOKENS 함정 회피)
+ *   4) 재시도 (3회 exp backoff)
+ *   5) 에러를 LlmCallError로 통일
+ *   6) 토큰/비용 추적
  *
  * ─────────────────────────────────────────────────────────────
  * Anthropic vs Gemini의 차이점 (이 어댑터에서 흡수)
@@ -20,7 +21,12 @@
  * 4) **JSON Schema**: Gemini는 JSON Schema의 일부만 지원 (subset). 1차 분류기 스키마는 단순해서 OK.
  * 5) **캐싱**: Gemini는 별도 API (ai.caches). 1차 미적용 — Anthropic의 inline cache_control 같은 게 없음.
  *    → 같은 시스템 프롬프트로 여러 번 호출해도 캐시 안 됨. 비용 약간 더 들 수 있음 (5-10%).
- * 6) **에러 형식**: Gemini SDK는 ApiError 또는 ClientError 등으로 throw. status 필드 있음.
+ * 6) **Thinking 모델 함정** ← M3a-2 검증에서 발견
+ *    Gemini 3.x Pro는 reasoning 모델이라 응답 전 internal thinking 토큰을 사용.
+ *    maxOutputTokens가 thinking + 출력 합산이라, thinking이 예산 다 먹으면 functionCall이
+ *    못 나오고 stopReason="MAX_TOKENS"로 끝남. 분류 작업은 reasoning 불필요하므로
+ *    thinkingConfig.thinkingBudget = 0 으로 끄는 게 맞음. (속도 ↑, 비용 ↓, 정확도 영향 미미)
+ * 7) **에러 형식**: Gemini SDK는 ApiError 또는 ClientError 등으로 throw. status 필드 있음.
  */
 
 import { GoogleGenAI, FunctionCallingConfigMode } from "@google/genai";
@@ -53,7 +59,6 @@ function getClient(): GoogleGenAI {
       { provider: "gemini" },
     );
   }
-  // GOOGLE_API_KEY 또는 GEMINI_API_KEY (SDK가 둘 다 인식하지만 GOOGLE_API_KEY 우선)
   const key = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
   if (!key) {
     throw new LlmCallError(
@@ -78,17 +83,14 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
   const client = getClient();
   const model = input.model ?? DEFAULT_MODEL;
   const maxRetries = input.maxRetries ?? 3;
+  const label = input.callerLabel ?? "gemini";
 
   // messages → Gemini Content[] 변환
-  // Gemini는 role이 "user" | "model" — assistant → model로 변환
   const contents: Content[] = input.messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }],
   }));
 
-  // Tool 변환 — JSON Schema → Gemini Schema
-  // 1차 분류기 스키마는 단순해서 거의 그대로 통과.
-  // 미래에 복잡한 스키마 들어오면 여기서 변환 보강.
   const functionDeclaration: FunctionDeclaration = {
     name: input.tool.name,
     description: input.tool.description,
@@ -98,12 +100,20 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
   let lastError: unknown = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      console.log(
+        `[${label}] gemini call attempt=${attempt + 1}/${maxRetries + 1} model=${model} maxTokens=${input.maxTokens}`,
+      );
+
       const response: GenerateContentResponse = await client.models.generateContent({
         model,
         contents,
         config: {
           systemInstruction: input.system,
           maxOutputTokens: input.maxTokens,
+          // Thinking 비활성화 — 분류 작업은 reasoning 불필요.
+          // 켜져 있으면 thinking 토큰이 maxOutputTokens를 다 먹어서
+          // functionCall이 안 나오고 MAX_TOKENS로 끝남.
+          thinkingConfig: { thinkingBudget: 0 },
           tools: [{ functionDeclarations: [functionDeclaration] }],
           toolConfig: {
             functionCallingConfig: {
@@ -119,37 +129,49 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
         },
       });
 
-      // tool 호출 결과 추출
-      // GenerateContentResponse.functionCalls는 helper getter
-      const calls = response.functionCalls;
+      // tool 호출 결과 추출 — 안전하게 try로 감쌈 (SDK getter가 throw 가능)
+      let calls: GenerateContentResponse["functionCalls"];
+      let textPreview = "";
+      let finishReason: string = "UNKNOWN";
+      try {
+        calls = response.functionCalls;
+        textPreview = (response.text ?? "").slice(0, 200);
+        finishReason = String(response.candidates?.[0]?.finishReason ?? "UNKNOWN");
+      } catch (extractErr) {
+        console.error(`[${label}] response 추출 실패`, extractErr);
+        throw new LlmCallError(
+          "BAD_RESPONSE",
+          `Gemini 응답 파싱 실패: ${extractErr instanceof Error ? extractErr.message : "unknown"}`,
+          { provider: "gemini", retriable: true, cause: extractErr },
+        );
+      }
+
+      console.log(
+        `[${label}] gemini response stopReason=${finishReason} functionCalls=${calls?.length ?? 0} textLen=${textPreview.length}`,
+      );
+
       const matchedCall = calls?.find((c) => c.name === input.tool.name);
 
       if (!matchedCall || !matchedCall.args) {
-        // 모델이 tool 안 부르고 자유 텍스트로만 답한 경우
-        const text = response.text ?? "(no text)";
-        const preview = text.slice(0, 200);
+        const reason = finishReason === "MAX_TOKENS"
+          ? "응답이 maxTokens 한도에서 끊김 (thinking 모델일 가능성 — thinkingBudget=0 확인)"
+          : `tool 호출 없음, 자유 텍스트 응답: ${textPreview}`;
         throw new LlmCallError(
           "TOOL_NOT_CALLED",
-          `LLM이 tool을 호출하지 않았습니다. 응답: ${preview}`,
+          `LLM이 tool을 호출하지 않았습니다. ${reason}`,
           { provider: "gemini", retriable: false },
         );
       }
 
-      // 사용량 추출
-      // response.usageMetadata 가 표준
       const meta = response.usageMetadata;
       const usage = {
         inputTokens: meta?.promptTokenCount ?? 0,
         outputTokens: meta?.candidatesTokenCount ?? 0,
         cacheReadTokens: meta?.cachedContentTokenCount ?? 0,
-        cacheCreationTokens: 0, // Gemini는 명시적 캐시 생성 카운트 없음
+        cacheCreationTokens: 0,
       };
 
       const rawCostUsd = calculateCost(model, usage);
-
-      // stopReason 추출 — candidates[0].finishReason
-      const finishReason =
-        response.candidates?.[0]?.finishReason ?? "UNKNOWN";
 
       return {
         output: matchedCall.args as TInput,
@@ -157,11 +179,14 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
         model,
         usage,
         rawCostUsd,
-        stopReason: String(finishReason),
+        stopReason: finishReason,
       };
     } catch (e) {
       lastError = e;
-      const wrapped = wrapGeminiError(e, input.callerLabel);
+      const wrapped = wrapGeminiError(e, label);
+      console.error(
+        `[${label}] gemini error attempt=${attempt + 1} code=${wrapped.code} retriable=${wrapped.retriable} message=${wrapped.message}`,
+      );
       const remaining = maxRetries - attempt;
       if (!wrapped.retriable || remaining === 0) {
         throw wrapped;
@@ -171,7 +196,7 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
     }
   }
 
-  throw wrapGeminiError(lastError, input.callerLabel);
+  throw wrapGeminiError(lastError, label);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -183,8 +208,6 @@ function wrapGeminiError(error: unknown, callerLabel?: string): LlmCallError {
 
   const label = callerLabel ? `[${callerLabel}] ` : "";
 
-  // @google/genai 의 에러는 클래스 직접 import가 어렵게 export됨.
-  // status 필드가 있는지로 판별.
   const errAny = error as { status?: number; message?: string; name?: string };
   const status = errAny?.status;
   const message = errAny?.message ?? "unknown error";
@@ -220,7 +243,6 @@ function wrapGeminiError(error: unknown, callerLabel?: string): LlmCallError {
     );
   }
 
-  // 네트워크 등 status 없는 에러
   return new LlmCallError(
     "UNKNOWN",
     `${label}Gemini 호출 실패: ${message}`,
