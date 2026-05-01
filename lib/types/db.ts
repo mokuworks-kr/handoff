@@ -36,6 +36,17 @@ export type CreditTransaction = {
   created_at: string;
 };
 
+/**
+ * projects 테이블의 한 행.
+ *
+ * 주의: 컬럼 이름은 SQL 따라 snake_case (created_at, design_tokens 등).
+ * Document.designTokens (camelCase) 와 다른 위치 — 이건 DB 컬럼이라 SQL 컨벤션 따름.
+ *
+ * design_tokens 컬럼은 Document.designTokens 와 중복 저장된다.
+ *   - design_tokens (top-level 컬럼): 검색/필터링·인덱싱 용도
+ *   - document.designTokens (JSONB 안): 정합성·완전한 문서 객체의 일부
+ * 두 곳을 항상 같이 업데이트해야 함. 이 책임은 lib/projects/ 의 헬퍼에서.
+ */
 export type Project = {
   id: string;
   user_id: string;
