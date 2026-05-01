@@ -55,19 +55,41 @@
  *    통계 집계의 키로만 쓴다.
  *    그리드 어휘(DesignTokens.gridVocabulary) 자체는 frames 좌표에 영향을 주지
  *    않는다 — LLM이 비율을 고를 때만 참조하는 책 단위 화이트리스트일 뿐.
+ *
+ * 8) 원고와 디자인의 분리 (M3a-3 추가)
+ *    Document.manuscript는 ClassifiedManuscript — "원고와 분류".
+ *    Document.pages는 그 위에 페이지네이션 + 디자인이 입혀진 결과.
+ *
+ *    원고는 분류된 시점에 박힘 (manuscript). 사용자가 디자인을 바꿔도 manuscript는
+ *    그대로. 페이지네이션 LLM은 manuscript + designTokens → pages 를 매번 새로
+ *    만들 수 있다 (만들기로 결정한 시점만). 이 분리가 §A 확장 축의 기반.
+ *
+ * 9) 출처 추적 (M3a-3 추가, 커뮤니티 확장 대비)
+ *    Document.origin 은 "이 문서가 어떤 디자인/콤포지션 카탈로그에서 시작했는지"의
+ *    참조. 사용자가 디자인을 편집하면 그 결과는 Document.styles 에 박히고,
+ *    origin 은 "원본이 어디였는지"의 메타데이터로만 남는다.
+ *
+ *    1차 출시에서는 builtin 카탈로그만 있어 source: "builtin" 고정.
+ *    미래 커뮤니티 카탈로그 도입 시 source: "community" + url + author 추가.
+ *
+ *    이 필드는 §A "확장 축"의 5번째 축(공유 어댑터)을 위한 사전 작업이다.
+ *    1차 출시 시점에 박아두면 미래에 데이터 마이그레이션 비용 0.
  */
 
 import type { DesignTokens } from "./design-tokens";
 import type { Frame } from "./frames";
 import type { Color, Font, ParagraphStyle, CharacterStyle } from "./styles";
+import type { ClassifiedManuscript } from "@/lib/classify/types";
 
 /**
  * 추상 모델 스키마 버전.
  * 마이너 변경(필드 추가, 옵셔널 확장)은 그대로 두고,
  * 기존 필드 타입/의미가 바뀌는 메이저 변경 시 +1.
  * 마이그레이션 함수는 lib/layout/migrations.ts (M3 시점에 추가 예정).
+ *
+ * v2 (M3a-3): manuscript + origin 필드 추가. 둘 다 옵셔널이라 v1 데이터 호환됨.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export type Unit = "mm" | "pt" | "px" | "pica";
 
@@ -173,6 +195,41 @@ export type Page = {
   hiddenMasterFrameIds?: string[];
 };
 
+/**
+ * 문서의 출처 정보.
+ *
+ * "이 문서가 어떤 디자인/콤포지션 카탈로그에서 시작했는지"의 메타데이터.
+ * 사용자가 디자인을 편집하면 그 결과는 Document.styles 에 박히고, origin 은
+ * 원본 추적 용도로만 남는다.
+ *
+ * 1차 출시: builtin 카탈로그만. source: "builtin" 고정.
+ * 미래 커뮤니티 카탈로그: source: "community" + url + author.
+ *
+ * 이 필드가 미래에 5번째 확장 축(공유 어댑터)의 데이터 기반이 된다 (§A).
+ * 지금 박아두면 미래 마이그레이션 비용 0.
+ */
+export type DocumentOrigin = {
+  /** 원본 디자인 슬러그 — DesignTokens.slug */
+  designSlug: string;
+  /** 원본 디자인 버전 — 카탈로그가 버전을 박을 때 */
+  designVersion?: string;
+  /**
+   * 출처 종류.
+   *   "builtin"   — Handoff 기본 카탈로그 (public/design-md/*.md)
+   *   "community" — 커뮤니티 업로드 (미래)
+   *   "user"      — 사용자가 직접 만든 카탈로그 (미래)
+   */
+  source: "builtin" | "community" | "user";
+  /** 외부 URL — community/user 출처에서 사용 */
+  url?: string;
+  /** 작자. 1차 builtin은 비어있거나 "handoff-builtin" */
+  author?: {
+    id: string;
+    name: string;
+    url?: string;
+  };
+};
+
 export type Document = {
   /** 추상 모델 스키마 버전. 마이그레이션 시 사용. */
   schemaVersion: number;
@@ -188,6 +245,23 @@ export type Document = {
   fold?: Fold;
 
   designTokens: DesignTokens;
+
+  /**
+   * 분류된 원고. M3a-3 시점부터 박힘.
+   *
+   * 페이지네이션 LLM(M3b)이 manuscript + designTokens 를 보고 pages 를 만든다.
+   * 사용자가 디자인을 바꿔도 manuscript는 그대로. 페이지네이션을 다시 돌리면
+   * 같은 원고에 다른 디자인이 입혀진 새 pages 가 만들어진다.
+   *
+   * 옵셔널인 이유: M3a-3 이전에 만들어진 프로젝트(있다면) 호환 + 빈 프로젝트 시드용.
+   */
+  manuscript?: ClassifiedManuscript;
+
+  /**
+   * 출처 정보. M3a-3 시점부터 박힘 (커뮤니티 확장 대비).
+   * 1차 출시에는 source: "builtin" 만 등장.
+   */
+  origin?: DocumentOrigin;
 
   /** 마스터 페이지 목록 (페이지 번호, 러닝 헤더 등 공통 요소) */
   masters?: Master[];
@@ -260,6 +334,11 @@ export const EMPTY_BOUND_DOCUMENT: Document = {
       bodyLineHeight: 1.6,
     },
   },
+  origin: {
+    designSlug: "default",
+    source: "builtin",
+    author: { id: "handoff-builtin", name: "Handoff" },
+  },
   pages: [],
   styles: {
     paragraphStyles: [],
@@ -310,6 +389,11 @@ export const EMPTY_FOLDED_DOCUMENT: Document = {
       bodySize: 10.5,
       bodyLineHeight: 1.6,
     },
+  },
+  origin: {
+    designSlug: "default",
+    source: "builtin",
+    author: { id: "handoff-builtin", name: "Handoff" },
   },
   pages: [],
   styles: {
