@@ -81,14 +81,37 @@ export type LlmPageOutput = {
   /** colon 표기 변형 슬롯 선택값 (콤포지션의 variants 에 있는 ID/option) */
   variants?: Record<string, string>;
   /**
+   * 이 페이지가 담는 manuscript section ID 목록 (M3b-3 P10 박힘).
+   * LLM 이 직접 박는 유일한 콘텐츠 매핑 — "어느 섹션이 이 페이지에 들어가는지".
+   *
+   * 코드가 자동 처리:
+   *   1) sectionIds 의 각 섹션을 blocksInSection() 으로 풀어서 블록들 모음
+   *   2) separator 블록 자동 제외
+   *   3) 콤포지션 슬롯 종류 보고 자동 매핑 → slotBlockRefs 자동 채움
+   *
+   * 비유: LLM 은 "1페이지=표지섹션, 2페이지=PEG섹션..." 큰 그림만 결정.
+   * "표지섹션의 어느 블록을 main 슬롯에 박을지" 는 코드가 자동.
+   *
+   * 빈 배열 = 이 페이지에 들어갈 섹션 없음 (검증에서 잡힘).
+   *
+   * 타입은 옵셔널 — 옛 테스트 코드 (slotBlockRefs 직접 박는 패턴) 호환성.
+   * tool schema 에서는 required 로 LLM 강제.
+   */
+  sectionIds?: string[];
+  /**
    * 슬롯별 블록 ID 매핑.
    * 예: { wide: ["b0042", "b0043"], narrow: ["b0046"] }
    * 빈 배열 = 슬롯에 콘텐츠 없음 (slot.optional 인 경우만 허용, 아니면 검증 실패).
+   *
+   * M3b-3 P10 부터: LLM 이 직접 박지 않고 코드가 sectionIds 로부터 자동 채움.
+   * 검증·UI 흐름은 변경 없음 — 같은 형태로 채워지므로.
    */
   slotBlockRefs: Record<string, string[]>;
   /**
    * LLM 이 일부 슬롯을 의도적으로 비웠을 때 (slot.optional=true).
    * 비어있는 slotBlockRefs 와 구분 — 명시적 의도가 있으면 검증 통과.
+   *
+   * M3b-3 P10 부터: LLM 이 직접 박지 않고 코드가 자동 채움 (해당하면).
    */
   hiddenSlotIds?: string[];
   /**
