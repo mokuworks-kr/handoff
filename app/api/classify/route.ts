@@ -15,7 +15,7 @@
  *   401 — 비로그인 또는 화이트리스트 외
  *   400 — 파일/텍스트 누락
  *   422 — 파싱 실패 (지원하지 않는 형식 등)
- *   502 — Anthropic 호출 실패
+ *   502 — LLM 호출 실패
  *   500 — 기타
  */
 
@@ -24,7 +24,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isLabAllowed } from "@/lib/auth/whitelist";
 import { parseManuscript, ManuscriptParseError } from "@/lib/parsers";
 import { classifyManuscript } from "@/lib/classify";
-import { AnthropicCallError } from "@/lib/anthropic/call";
+import { LlmCallError } from "@/lib/llm";
 
 export async function POST(request: NextRequest) {
   // 1) 인증
@@ -97,11 +97,12 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(classified);
   } catch (e) {
-    if (e instanceof AnthropicCallError) {
+    if (e instanceof LlmCallError) {
       return NextResponse.json(
         {
           error: "classify failed",
           code: e.code,
+          provider: e.provider,
           message: e.message,
           // 부분 결과: 분류 실패해도 normalized는 보냄 (사용자가 원고 추출은 봤다는 신호)
           partial: { ...normalized, sections: [] },
