@@ -133,6 +133,21 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   // ── 4. LLM 출력 파싱 ─────────────────────────────────────────
   const llmBook = parseLlmOutput(toolOutput.output);
 
+  // 진단 로그 — 페이지 수 + 첫 페이지의 slotBlockRefs 형태 (검증 통과·실패 무관)
+  // 검증 실패시 어떤 모양으로 LLM 이 어겼는지 즉시 보임. 비용 0 (이미 메모리에 있는 객체).
+  console.log(
+    `[paginate] LLM 출력: pages=${llmBook.pages.length}, omissions=${llmBook.intentionalOmissions?.length ?? 0}, ` +
+      `p1.slotKeys=[${Object.keys(llmBook.pages[0]?.slotBlockRefs ?? {}).join(",")}], ` +
+      `p1.slotBlockCounts=${JSON.stringify(
+        Object.fromEntries(
+          Object.entries(llmBook.pages[0]?.slotBlockRefs ?? {}).map(([k, v]) => [
+            k,
+            (v as string[]).length,
+          ]),
+        ),
+      )}`,
+  );
+
   // ── 5. 검증 ──────────────────────────────────────────────────
   const validation = validateLlmOutput({
     book: llmBook,
@@ -142,10 +157,18 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   });
 
   if (validation.hasError) {
+    const errorCount = validation.issues.filter((i) => i.severity === "error").length;
+    console.error(
+      `[paginate] 검증 실패: error=${errorCount}, codes=${[
+        ...new Set(
+          validation.issues.filter((i) => i.severity === "error").map((i) => i.code),
+        ),
+      ].join(",")}`,
+    );
     throw new PaginateError(
       "VALIDATION_FAILED",
-      `페이지네이션 검증 실패: error ${validation.issues.filter((i) => i.severity === "error").length}건`,
-      { validation },
+      `페이지네이션 검증 실패: error ${errorCount}건`,
+      { validation, llmRaw: llmBook },
     );
   }
 
