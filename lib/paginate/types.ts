@@ -243,6 +243,9 @@ export type PaginateInput = {
  * stylesPatch: Document.styles 에 머지될 카탈로그 스냅샷.
  *   DesignTokens.print.* 에서 복사. 새 프로젝트 1회 동기화 (정책 §7-4).
  * llm: LLM 호출 메타 (model, tokens, cost) — 크레딧 차감 + 디버깅용.
+ * llmRaw: LLM 의 raw 출력 (검증 통과 후). 옵셔널 — lab/디버그 전용.
+ *   본 라우트는 무시. lab 라우트가 이걸로 rationale, slotBlockRefs, splitReason 등을
+ *   사용자에게 노출. 정상 흐름에서 추가 비용 0 (이미 함수 내부에 존재하던 객체).
  * validation: 검증 결과 — 사용자에게 warn/info 노출 또는 M3c 편집 힌트로 사용.
  *
  * **저장 책임은 호출자에게**. paginateBook() 은 DB 안 건드림.
@@ -264,6 +267,15 @@ export type PaginateOutput = {
     rawCostUsd: number;
     stopReason: string;
   };
+  /**
+   * LLM 의 검증 통과한 raw 출력. lab/디버그용.
+   *
+   * - LlmPageOutput 의 role, variants, slotBlockRefs, splitReason, rationale 등 보존.
+   * - 본 라우트(/api/paginate) 는 사용 안 함. 응답에 안 실음.
+   * - lab 라우트(/api/lab/paginate) 가 ResultView 에 표시.
+   * - 메모리·시간 비용 0 (이미 paginateBook 내부에 있던 객체를 반환에 포함만).
+   */
+  llmRaw?: LlmBookOutput;
   validation: ValidationResult;
 };
 
