@@ -131,6 +131,7 @@ function expectNoError(result: ReturnType<typeof validateLlmOutput>, label: stri
 // Test 1 — 정상 케이스: 0 errors (회귀 방지)
 // ─────────────────────────────────────────────────────────────
 
+(async () => {
 console.log("Test 1: 정상 케이스 — 0 errors");
 {
   const book: LlmBookOutput = {
@@ -423,3 +424,5 @@ console.log("\nTest 12: hidden + slotBlockRefs 모순");
 }
 
 console.log("\n전체 12개 테스트 모두 통과.");
+
+})();
