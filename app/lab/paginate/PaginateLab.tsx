@@ -24,6 +24,7 @@ import { PaginateResultView } from "@/components/paginate/ResultView";
 import type {
   PaginateResultPayload,
 } from "@/components/paginate/ResultView";
+import type { LlmPageOutput, LlmBookOutput } from "@/lib/paginate/types";
 import type { Project } from "@/lib/types";
 
 type ClassifiedProject = Pick<
@@ -36,6 +37,12 @@ type ApiError = {
   code?: string;
   message?: string;
   validation?: PaginateResultPayload["validation"];
+  /** 검증 실패 시 LLM 이 실제 뭘 출력했는지 표본 (lab 전용) */
+  llmRawSample?: {
+    totalPages: number;
+    firstPages: LlmPageOutput[];
+    intentionalOmissions: NonNullable<LlmBookOutput["intentionalOmissions"]>;
+  };
 };
 
 export function PaginateLab({
@@ -294,6 +301,38 @@ function ErrorView({ error }: { error: ApiError }) {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* LLM raw 출력 표본 — 검증 실패 시 LLM 이 정확히 뭘 출력했는지 디버그 */}
+      {error.llmRawSample && (
+        <div className="mt-3 space-y-2 border-t border-red-200 pt-3">
+          <div className="text-xs font-medium uppercase tracking-wide text-red-800">
+            LLM 출력 표본 (전체 {error.llmRawSample.totalPages}페이지 중 첫 {error.llmRawSample.firstPages.length}장)
+          </div>
+          {error.llmRawSample.firstPages.map((p, idx) => (
+            <details
+              key={idx}
+              className="rounded bg-white/60 px-3 py-2 text-[11px]"
+            >
+              <summary className="cursor-pointer font-mono text-red-900">
+                p.{p.pageNumber} · {p.pattern} · role={p.role} · slots={Object.keys(p.slotBlockRefs).length}
+              </summary>
+              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[10px] text-red-900/80">
+                {JSON.stringify(p, null, 2)}
+              </pre>
+            </details>
+          ))}
+          {error.llmRawSample.intentionalOmissions.length > 0 && (
+            <details className="rounded bg-white/60 px-3 py-2 text-[11px]">
+              <summary className="cursor-pointer font-mono text-red-900">
+                intentionalOmissions ({error.llmRawSample.intentionalOmissions.length}개)
+              </summary>
+              <pre className="mt-2 overflow-x-auto whitespace-pre-wrap text-[10px] text-red-900/80">
+                {JSON.stringify(error.llmRawSample.intentionalOmissions, null, 2)}
+              </pre>
+            </details>
+          )}
         </div>
       )}
     </div>
