@@ -10,7 +10,7 @@
  * 1) 텍스트 입력 → 직접 NormalizedManuscript로 변환 (문단별 split)
  * 2) 파일 입력 → 매직 바이트로 진짜 형식 판별:
  *    - %PDF-                    → pdf
- *    - PK + zip 내용 검사
+ *    - PK + JSZip으로 zip 내용 검사
  *      - mimetype 첫 파일       → hwpx (application/hwp+zip)
  *      - ppt/presentation.xml  → pptx
  *      - word/document.xml     → docx
@@ -25,18 +25,24 @@
  *    "지원하지 않는 형식입니다. 한컴오피스에서 .hwpx로 저장 후 다시 시도해주세요."
  *
  * ─────────────────────────────────────────────────────────────
- * 동적 import — pdf 파서만
+ * detectZipFormat 정책 (M3a-3-2c 변경)
  * ─────────────────────────────────────────────────────────────
  *
- * pdf-parse@2 가 내부적으로 pdfjs-dist를 쓰는데, pdfjs-dist는 브라우저용이라
- * Vercel serverless 환경에서 모듈 로딩 시점부터 깨진다 (DOMMatrix 미정의 등).
- * 라우트 모듈 전체가 깨져 docx/pptx/hwpx 까지 못 돌아가는 사고를 막기 위해
- * pdf 케이스에서만 dynamic import로 격리.
+ * 이전: ZIP 헤더를 직접 파싱해 첫 ~20개 entry 이름만 봤음.
+ * 문제: PowerPoint 가 큰 파일에 ZIP64 형식을 쓰면 compressedSize 가 0xFFFFFFFF 로
+ *       들어가 offset 계산이 망가져 두 번째 entry 부터 못 찾음. 작은 zip은 OK,
+ *       큰 zip은 fileNames 가 1개만 모이고 ppt/presentation.xml 못 찾아 unknown 으로 떨어짐.
  *
- * pdf 파서 라이브러리 자체 교체는 별도 작업 (M3a-2 후속).
- * 그때까지 PDF 업로드는 실패하지만 다른 3개 형식은 정상 동작.
+ * 현재: JSZip 으로 정직하게 zip 풀고 모든 파일 이름 검사.
+ *       장점: ZIP64·streaming·압축 형식 모두 호환. 정확함.
+ *       비용: 메모리 + 시간 약간. 단 어차피 그 다음 단계(parsePptx 등)에서
+ *             JSZip 다시 호출하므로 이중 작업 아님 — 라우팅 단계에서 한 번 풀고
+ *             결과는 버려짐 (parser가 다시 풀음). 이중 풀기 비용 < 사용자 경험 개선.
+ *       미래: 파서 함수가 미리 풀린 JSZip 객체를 받아 재활용하는 리팩토링 가능.
+ *             지금은 안 함 — 단순함 우선.
  */
 
+import JSZip from "jszip";
 import {
   blockId,
   type Block,
@@ -88,7 +94,6 @@ export async function parseManuscript(input: ParseInput): Promise<NormalizedManu
       break;
     case "pdf": {
       // dynamic import — pdf-parse의 무거운 의존성을 라우트 로딩 시점에서 격리.
-      // 이 케이스에서만 pdf 코드 + pdfjs-dist 평가됨.
       const { parsePdf } = await import("./pdf");
       result = await parsePdf({ buffer, filename: input.filename });
       break;
@@ -174,11 +179,9 @@ async function detectFormat(
     buffer[6] === 0x1a &&
     buffer[7] === 0xe1
   ) {
-    // 확장자가 .hwp 인지 추가 확인 (다른 OLE2 형식과 구분)
     if (filename.toLowerCase().endsWith(".hwp")) {
       return "hwp";
     }
-    // OLE2이지만 .hwp 아님 — 다른 옛날 오피스(doc/xls/ppt). 미지원.
     return "unknown";
   }
 
@@ -186,48 +189,39 @@ async function detectFormat(
 }
 
 /**
- * ZIP 파일 안을 들여다보고 docx/pptx/hwpx 구분.
+ * ZIP 파일 안 들여다보고 docx/pptx/hwpx 구분.
  *
- * 라이브러리(JSZip 등)를 부르면 무겁고 비동기. 우리는 ZIP 헤더를 직접 읽어
- * 첫 몇 개 파일 이름만 본다.
+ * JSZip 기반 — 파일 이름 전부 보고 시그니처 매칭.
+ * 우선순위:
+ *   1) hwpx — 첫 entry 가 "mimetype" (OWPML 표준)
+ *   2) docx — "word/document.xml" 존재
+ *   3) pptx — "ppt/presentation.xml" 존재
+ *   4) 그 외 → unknown
+ *
+ * JSZip 호출 실패(파일이 zip 흉내 내지만 깨졌거나 암호화 등) → unknown.
  */
 async function detectZipFormat(buffer: Buffer): Promise<DetectedFormat> {
-  const fileNames: string[] = [];
-  let offset = 0;
-  const maxEntries = 20;
-
-  while (offset + 30 < buffer.length && fileNames.length < maxEntries) {
-    if (
-      buffer[offset] !== 0x50 ||
-      buffer[offset + 1] !== 0x4b ||
-      buffer[offset + 2] !== 0x03 ||
-      buffer[offset + 3] !== 0x04
-    ) {
-      break;
-    }
-
-    const fileNameLength = buffer.readUInt16LE(offset + 26);
-    const extraFieldLength = buffer.readUInt16LE(offset + 28);
-    const compressedSize = buffer.readUInt32LE(offset + 18);
-
-    if (offset + 30 + fileNameLength > buffer.length) break;
-
-    const fileName = buffer.toString(
-      "utf8",
-      offset + 30,
-      offset + 30 + fileNameLength,
-    );
-    fileNames.push(fileName);
-
-    offset += 30 + fileNameLength + extraFieldLength + compressedSize;
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(buffer);
+  } catch {
+    return "unknown";
   }
 
+  const fileNames = Object.keys(zip.files);
+
+  // hwpx 가 가장 명확한 시그니처 — "mimetype" 가 첫 파일이고 내용이 application/hwp+zip
+  // (단순화: 첫 파일 이름이 "mimetype" 인지만 검사)
   if (fileNames[0] === "mimetype") {
     return "hwpx";
   }
+
+  // docx
   if (fileNames.includes("word/document.xml")) {
     return "docx";
   }
+
+  // pptx
   if (fileNames.includes("ppt/presentation.xml")) {
     return "pptx";
   }
@@ -259,7 +253,7 @@ function formatFromExtension(filename: string): DetectedFormat | null {
  * 정책 (M3a-1):
  *   - 빈 줄(연속 \n)을 단락 경계로 사용
  *   - 한 단락 = 한 ParagraphBlock
- *   - heading 추정 안 함 (워드에서 복사하면 heading 정보가 없음 — 분류기 위임)
+ *   - heading 추정 안 함 (분류기 위임)
  *   - 인라인 스타일 없음 (평문이라)
  *   - 표/리스트 안 만듦 (평문에서 추정 어려움)
  */
