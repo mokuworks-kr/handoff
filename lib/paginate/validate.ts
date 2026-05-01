@@ -292,7 +292,18 @@ function isBlockKindCompatible(
 ): boolean {
   switch (slotKind) {
     case "text":
-      return blockType === "heading" || blockType === "paragraph" || blockType === "list";
+      // 1차 검증 단계 정책 (M3b-3 P11): text 슬롯이 모든 콘텐츠 블록 종류 허용.
+      // 본래는 heading/paragraph/list 만이지만, 어휘를 [12] 단일 슬롯으로 좁힌 1차에서는
+      // table/image 같은 블록도 main 슬롯에 박혀야 함 — 그 외 슬롯이 카탈로그에 없으므로.
+      // expandSectionIdsToSlots 가 자동으로 모든 블록을 text 슬롯에 박음.
+      // M2 본격 디자인 작업 시 (다중 슬롯 어휘 활성화) 원래 엄격함 복구 필요.
+      return (
+        blockType === "heading" ||
+        blockType === "paragraph" ||
+        blockType === "list" ||
+        blockType === "table" ||
+        blockType === "image"
+      );
     case "image":
       return blockType === "image";
     case "table":
