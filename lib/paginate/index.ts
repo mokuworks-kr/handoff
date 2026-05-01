@@ -74,6 +74,7 @@ import {
   type PaginateInput,
   type PaginateOutput,
   type ResolvedPageBlueprint,
+  type ValidationIssue,
 } from "./types";
 
 // ─────────────────────────────────────────────────────────────
@@ -96,140 +97,272 @@ import {
 const MODEL_PAGINATE = "gemini-2.5-flash";
 const MAX_OUTPUT_TOKENS = 32000; // 시드 30~40페이지 기준 충분 (page 당 ~500토큰 ×40 = 20K)
 
+// retry 정책 (M3b-5 1단계 후속, 2026-05):
+//   검증 실패 시 자연어 피드백으로 재시도. 총 시도 횟수 = 1 + MAX_RETRIES.
+//
+// 왜 1번만 retry:
+//   1) Vercel Hobby 60초 함수 한도. flash 호출 ~10~15초 × 2 = ~25~30초 + buffer = 안전 마진
+//   2) 첫 시도 통과율이 1차 검증 단계에서 충분히 높음 — retry 는 안전망
+//   3) 비용 2배 — 무료 사용자 부담 고려
+//
+// 부족하면 (M3b-5 2단계 이상에서) 2번으로 늘리거나, Anthropic 스위치 후 maxDuration 검토.
+const PAGINATE_RETRY_COUNT = 1;
+
 export async function paginateBook(input: PaginateInput): Promise<PaginateOutput> {
   // ── 1. 입력 검증 ────────────────────────────────────────────
   validateInput(input);
 
   // ── 2. user message 구성 (§16.5 동적 주입) ─────────────────
-  const userMessage = buildUserMessage(input);
+  const initialUserMessage = buildUserMessage(input);
 
-  // ── 3. LLM 호출 ─────────────────────────────────────────────
-  //
-  // callTool 진짜 시그니처 (lib/llm/types.ts 참조):
-  //   { provider?, model?, system, messages, tool, maxTokens, forceToolUse?, callerLabel? }
-  //
-  // - provider 미지정 → 환경변수 LLM_PROVIDER (기본 anthropic 또는 gemini)
-  // - model 미지정 → 어댑터의 기본 모델
-  //   페이지네이션은 1차 검증 단계에서 flash 명시 (위 정책 메모 참조).
-  //   어댑터가 flash 모델은 자동으로 thinking 비활성 처리.
-  // - forceToolUse: true (분류기와 동일, 자유 텍스트 응답 안 받음)
-  // - idempotencyKey: lib/llm 미지원. 라우트의 크레딧 차감 멱등성에서만 사용.
   const callToolFn = input.callTool ?? callTool;
-  let toolOutput;
-  try {
-    toolOutput = await callToolFn<LlmBookOutput>({
-      provider: input.provider,
-      model: MODEL_PAGINATE,
-      system: PAGINATE_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userMessage }],
-      tool: {
-        name: TOOL_SCHEMA.name,
-        description: TOOL_SCHEMA.description,
-        input_schema: TOOL_SCHEMA.parameters,
-      },
-      maxTokens: MAX_OUTPUT_TOKENS,
-      // Vercel Hobby 60초 함수 한도 안전 마진. 어댑터 기본 3 (총 4시도, backoff 합 ~20초)
-      // 은 LLM 본 호출 시간과 합쳐 timeout 위험. 1로 줄여 총 2시도, backoff ~500ms.
-      // 503 등 일시적 장애 시 사용자가 다시 누르는 흐름으로.
-      maxRetries: 1,
-      forceToolUse: true,
-      callerLabel: input.callerLabel ?? "paginate-book",
-    });
-  } catch (e: unknown) {
-    if (e instanceof LlmCallError) {
-      throw new PaginateError("LLM_FAILED", `LLM 호출 실패: ${e.message}`, {
+
+  // 누적 LLM 메타 — 사용자가 retry 비용까지 모두 부담 (정직).
+  // 마지막 시도의 model/stopReason 만 의미 있음 — 모델은 항상 같지만 stopReason 은 시도마다 다를 수 있음.
+  let cumulativeInputTokens = 0;
+  let cumulativeOutputTokens = 0;
+  let cumulativeCacheReadTokens = 0;
+  let cumulativeCost = 0;
+  let lastModel = "";
+  let lastStopReason = "";
+
+  // 직전 시도 결과 보관 — retry 피드백 메시지 구성용
+  let lastValidation: ReturnType<typeof validateLlmOutput> | null = null;
+  let lastLlmBook: LlmBookOutput | null = null;
+
+  for (let attempt = 0; attempt <= PAGINATE_RETRY_COUNT; attempt++) {
+    // ── 3. user message 구성 — 첫 시도는 원본, 재시도는 피드백 추가 ──
+    const userMessage =
+      attempt === 0
+        ? initialUserMessage
+        : buildRetryUserMessage(initialUserMessage, lastValidation!, lastLlmBook!);
+
+    // ── 4. LLM 호출 ─────────────────────────────────────────────
+    let toolOutput;
+    try {
+      toolOutput = await callToolFn<LlmBookOutput>({
+        provider: input.provider,
+        model: MODEL_PAGINATE,
+        system: PAGINATE_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
+        tool: {
+          name: TOOL_SCHEMA.name,
+          description: TOOL_SCHEMA.description,
+          input_schema: TOOL_SCHEMA.parameters,
+        },
+        maxTokens: MAX_OUTPUT_TOKENS,
+        // 어댑터 내부 retry (503 등 일시 장애용). 우리의 검증 retry 와는 별개.
+        // Vercel Hobby 60초 한도 안전 마진 — 1로 줄여 총 2시도, backoff ~500ms.
+        maxRetries: 1,
+        forceToolUse: true,
+        callerLabel:
+          (input.callerLabel ?? "paginate-book") +
+          (attempt > 0 ? `:retry${attempt}` : ""),
+      });
+    } catch (e: unknown) {
+      if (e instanceof LlmCallError) {
+        throw new PaginateError("LLM_FAILED", `LLM 호출 실패: ${e.message}`, {
+          cause: e,
+        });
+      }
+      throw new PaginateError("LLM_FAILED", "LLM 호출 중 알 수 없는 오류", {
         cause: e,
       });
     }
-    throw new PaginateError("LLM_FAILED", "LLM 호출 중 알 수 없는 오류", {
-      cause: e,
+
+    // 비용 누적 — retry 시도분도 사용자 부담
+    cumulativeInputTokens += toolOutput.usage.inputTokens;
+    cumulativeOutputTokens += toolOutput.usage.outputTokens;
+    cumulativeCacheReadTokens += toolOutput.usage.cacheReadTokens;
+    cumulativeCost += toolOutput.rawCostUsd;
+    lastModel = toolOutput.model;
+    lastStopReason = toolOutput.stopReason;
+
+    // ── 5. LLM 출력 파싱 ─────────────────────────────────────────
+    const llmBook = parseLlmOutput(toolOutput.output);
+
+    // ── 5.5 sectionIds → slotBlockRefs 자동 매핑 (M3b-3 P10) ────
+    try {
+      expandSectionIdsToSlots(llmBook, input.manuscript, input.patterns);
+    } catch (e) {
+      if (e instanceof PaginateError) throw e;
+      throw new PaginateError(
+        "REALIZE_FAILED",
+        `sectionIds 자동 매핑 실패: ${e instanceof Error ? e.message : "unknown"}`,
+        { cause: e },
+      );
+    }
+
+    // 진단 로그
+    console.log(
+      `[paginate] attempt=${attempt} LLM 출력: pages=${llmBook.pages.length}, ` +
+        `p1.sectionIds=[${(llmBook.pages[0]?.sectionIds ?? []).join(",")}], ` +
+        `p1.slotBlockCounts=${JSON.stringify(
+          Object.fromEntries(
+            Object.entries(llmBook.pages[0]?.slotBlockRefs ?? {}).map(([k, v]) => [
+              k,
+              (v as string[]).length,
+            ]),
+          ),
+        )}`,
+    );
+
+    // ── 6. 검증 ──────────────────────────────────────────────────
+    const validation = validateLlmOutput({
+      book: llmBook,
+      manuscript: input.manuscript,
+      patterns: input.patterns,
+      designTokens: input.designTokens,
     });
-  }
 
-  // ── 4. LLM 출력 파싱 ─────────────────────────────────────────
-  const llmBook = parseLlmOutput(toolOutput.output);
+    if (!validation.hasError) {
+      // ── 7. 검증 통과 — 페이지 빌드하고 반환 ───────────────────
+      const resolved = resolveBlueprints(llmBook.pages, input);
+      const pages = buildPages(resolved, input);
+      const stylesPatch = syncStylesFromDesignTokens(input.designTokens);
 
-  // ── 4.5 sectionIds → slotBlockRefs 자동 매핑 (M3b-3 P10) ────
-  // LLM 은 sectionIds 만 박음. 코드가 그것을 풀어 슬롯에 박음.
-  // expandSectionIdsToSlots() 가 in-place 로 page.slotBlockRefs 채움.
-  // 검증·UI 흐름은 변경 없음 — 같은 형태로 채워지므로.
-  try {
-    expandSectionIdsToSlots(llmBook, input.manuscript, input.patterns);
-  } catch (e) {
-    // 자동 매핑 자체에서 throw 된 경우 (예: 다중 슬롯 콤포지션)
-    if (e instanceof PaginateError) throw e;
-    throw new PaginateError(
-      "REALIZE_FAILED",
-      `sectionIds 자동 매핑 실패: ${e instanceof Error ? e.message : "unknown"}`,
-      { cause: e },
-    );
-  }
+      console.log(
+        `[paginate] 통과 (attempt=${attempt}): pages=${pages.length}, ` +
+          `cumulativeCost=$${cumulativeCost.toFixed(4)}`,
+      );
 
-  // 진단 로그 — 페이지 수 + 첫 페이지의 sectionIds + 자동 매핑된 slotBlockRefs 형태.
-  // 검증 통과·실패 무관. 비용 0.
-  console.log(
-    `[paginate] LLM 출력: pages=${llmBook.pages.length}, ` +
-      `p1.sectionIds=[${(llmBook.pages[0]?.sectionIds ?? []).join(",")}], ` +
-      `p1.slotBlockCounts=${JSON.stringify(
-        Object.fromEntries(
-          Object.entries(llmBook.pages[0]?.slotBlockRefs ?? {}).map(([k, v]) => [
-            k,
-            (v as string[]).length,
-          ]),
-        ),
-      )}`,
-  );
+      return {
+        pages,
+        stylesPatch,
+        llm: {
+          model: lastModel,
+          inputTokens: cumulativeInputTokens,
+          outputTokens: cumulativeOutputTokens,
+          cacheReadTokens: cumulativeCacheReadTokens,
+          rawCostUsd: cumulativeCost,
+          stopReason: lastStopReason,
+        },
+        llmRaw: llmBook,
+        validation,
+      };
+    }
 
-  // ── 5. 검증 ──────────────────────────────────────────────────
-  const validation = validateLlmOutput({
-    book: llmBook,
-    manuscript: input.manuscript,
-    patterns: input.patterns,
-    designTokens: input.designTokens,
-  });
-
-  if (validation.hasError) {
-    const errorCount = validation.issues.filter((i) => i.severity === "error").length;
+    // ── 검증 실패 — retry 또는 throw ─────────────────────────
+    const errorCount = validation.issues.filter((i) => i.severity === "error")
+      .length;
+    const errorCodes = [
+      ...new Set(
+        validation.issues
+          .filter((i) => i.severity === "error")
+          .map((i) => i.code),
+      ),
+    ].join(",");
     console.error(
-      `[paginate] 검증 실패: error=${errorCount}, codes=${[
-        ...new Set(
-          validation.issues.filter((i) => i.severity === "error").map((i) => i.code),
-        ),
-      ].join(",")}`,
+      `[paginate] 검증 실패 (attempt=${attempt}): error=${errorCount}, codes=${errorCodes}`,
     );
-    throw new PaginateError(
-      "VALIDATION_FAILED",
-      `페이지네이션 검증 실패: error ${errorCount}건`,
-      { validation, llmRaw: llmBook },
+
+    // 마지막 시도였으면 throw — 누적 메타 보존하고 싶지만 PaginateError 가 받지 않으므로 로그만.
+    if (attempt === PAGINATE_RETRY_COUNT) {
+      throw new PaginateError(
+        "VALIDATION_FAILED",
+        `페이지네이션 검증 실패: error ${errorCount}건 (시도 ${attempt + 1}회)`,
+        { validation, llmRaw: llmBook },
+      );
+    }
+
+    // 다음 시도 준비
+    lastValidation = validation;
+    lastLlmBook = llmBook;
+  }
+
+  // 도달 불가 — for 루프가 통과하면 return, 마지막 시도면 throw. TS 만족용.
+  throw new PaginateError(
+    "VALIDATION_FAILED",
+    "페이지네이션 검증 실패: 알 수 없는 흐름",
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// retry 피드백 메시지 — 검증 실패한 직전 시도의 정보를 자연어로
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * retry 시 보낼 user message 구성.
+ *
+ * 정책:
+ *   - 원본 user message 그대로 + 검증 피드백 섹션 추가
+ *   - issue 를 코드별로 그룹화 (24건 다 보내면 토큰 낭비, LLM 도 핵심 못 잡음)
+ *   - 코드별 핵심 메시지 + 예시 1~2건 (pageNumber/blockId 포함)
+ *   - 자연어로 "이전 시도 잘못, 이번엔 이렇게 해" 명확하게
+ *
+ * 토큰 비용:
+ *   - 피드백 섹션 ~500토큰 (24건 그룹화 후). 본 user message ~7000~10000토큰 대비 작음.
+ */
+function buildRetryUserMessage(
+  originalUserMessage: string,
+  lastValidation: { issues: ValidationIssue[] },
+  lastLlmBook: LlmBookOutput,
+): string {
+  const errors = lastValidation.issues.filter((i) => i.severity === "error");
+  // 코드별 그룹화
+  const byCode = new Map<string, ValidationIssue[]>();
+  for (const issue of errors) {
+    const list = byCode.get(issue.code) ?? [];
+    list.push(issue);
+    byCode.set(issue.code, list);
+  }
+
+  // 각 코드별 핵심 메시지 — issue 코드 → 자연어 가이드
+  const guideByCode: Record<string, string> = {
+    BLOCK_DUPLICATED:
+      "같은 블록을 두 개 이상의 페이지에 박지 말 것. 같은 sectionId 를 여러 페이지의 sectionIds 에 박는 것이 가장 흔한 원인. 한 섹션이 너무 길어 두 페이지로 나누고 싶다면, 섹션 자체를 둘로 쪼갤 수 없으므로 다른 방식(예: 같은 섹션을 한 페이지에 모두 박거나, 콘텐츠를 책 흐름상 자연스럽게 다른 섹션과 합치거나)으로 처리.",
+    BLOCK_ORPHANED:
+      "매니스크립트의 모든 콘텐츠 블록(separator 제외)이 어느 한 페이지의 sectionIds 안에 들어가야 함. 누락된 섹션 ID 를 어딘가의 페이지에 추가하거나, intentionalOmissions 에 명시 (단 1차 정책상 권장하지 않음).",
+    BLOCK_NOT_FOUND:
+      "sectionIds 에 박힌 ID 가 매니스크립트의 sections 에 실재해야 함. 매니스크립트 sections 목록을 다시 확인.",
+    SLOT_MISMATCH:
+      "콤포지션 카탈로그의 슬롯 정의(필수성·종류)와 출력이 일치해야 함. 필수 슬롯이 비어있거나, 카탈로그에 없는 슬롯 ID 사용 시 발생.",
+    INVALID_PATTERN_SLUG:
+      "콤포지션 카탈로그(patterns)에 정의된 slug 만 사용. 카탈로그에 없는 slug 출력 금지.",
+    PATTERN_NOT_IN_VOCABULARY:
+      "사용한 콤포지션의 비율이 designTokens.gridVocabulary 안에 있어야 함. 어휘 밖 콤포지션 사용 금지.",
+    VARIANT_INVALID:
+      "variants 의 ID 와 value 가 콤포지션 정의와 일치해야 함. 카탈로그에 정의된 variant ID/option 만 사용.",
+  };
+
+  const sections: string[] = [];
+  for (const [code, issues] of byCode) {
+    const guide = guideByCode[code] ?? "";
+    const examples = issues.slice(0, 2).map((i) => {
+      const meta: string[] = [];
+      if (i.pageNumber !== undefined) meta.push(`p.${i.pageNumber}`);
+      if (i.slotId) meta.push(`slot=${i.slotId}`);
+      if (i.blockId) meta.push(`block=${i.blockId}`);
+      const metaStr = meta.length > 0 ? ` (${meta.join(", ")})` : "";
+      return `  - ${i.message}${metaStr}`;
+    });
+    sections.push(
+      `## ${code} (${issues.length}건)\n${examples.join("\n")}${
+        issues.length > 2 ? `\n  - ... 그 외 ${issues.length - 2}건` : ""
+      }${guide ? `\n\n  → ${guide}` : ""}`,
     );
   }
 
-  // ── 6. 변환: LlmPageOutput → ResolvedPageBlueprint ─────────
-  const resolved = resolveBlueprints(llmBook.pages, input);
+  // 직전 시도의 첫 페이지 출력 표본도 같이 보내 LLM 이 "내가 뭘 출력했는지" 인식하기 쉽게
+  const firstPageSample = lastLlmBook.pages[0]
+    ? JSON.stringify(lastLlmBook.pages[0], null, 2)
+    : "(빈 페이지 배열)";
 
-  // ── 7~8. realize() + Page 빌드 ──────────────────────────────
-  const pages = buildPages(resolved, input);
+  return `${originalUserMessage}
 
-  // ── 9. styles 동기화 ─────────────────────────────────────────
-  const stylesPatch = syncStylesFromDesignTokens(input.designTokens);
+# 직전 시도 검증 실패 — 다시 시도
 
-  // ── 10. 반환 ─────────────────────────────────────────────────
-  return {
-    pages,
-    stylesPatch,
-    llm: {
-      model: toolOutput.model,
-      inputTokens: toolOutput.usage.inputTokens,
-      outputTokens: toolOutput.usage.outputTokens,
-      cacheReadTokens: toolOutput.usage.cacheReadTokens,
-      rawCostUsd: toolOutput.rawCostUsd,
-      stopReason: toolOutput.stopReason,
-    },
-    // lab/디버그용 — 검증 통과한 LLM raw 출력. 본 라우트는 무시.
-    // rationale, slotBlockRefs, splitReason 등 LLM 의도 메타 보존.
-    llmRaw: llmBook,
-    validation,
-  };
+방금 너의 출력이 검증을 통과하지 못했어. 같은 입력으로 다시 시도해. 아래 문제들을 피해서 출력해줘.
+
+${sections.join("\n\n")}
+
+## 직전 시도의 첫 페이지 (참고용)
+
+\`\`\`json
+${firstPageSample}
+\`\`\`
+
+다시 한 번: 같은 매니스크립트·디자인토큰·콤포지션 카탈로그를 가지고, 위 검증 실패를 피해 새 출력을 만들어줘. 페이지 분할은 매니스크립트의 SeparatorBlock("page") 우선 → 그 다음 섹션 의미 → 콘텐츠 양 순서로.`;
 }
 
 // ─────────────────────────────────────────────────────────────
