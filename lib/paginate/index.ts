@@ -52,6 +52,7 @@ import type {
 import { realize } from "@/lib/layout/grid";
 import { findPatternBySlug } from "@/lib/layout/patterns";
 import { callTool, LlmCallError } from "@/lib/llm";
+import { blocksInSection } from "@/lib/classify/types";
 import type {
   Block,
   HeadingBlock,
@@ -148,11 +149,27 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   // ── 4. LLM 출력 파싱 ─────────────────────────────────────────
   const llmBook = parseLlmOutput(toolOutput.output);
 
-  // 진단 로그 — 페이지 수 + 첫 페이지의 slotBlockRefs 형태 (검증 통과·실패 무관)
-  // 검증 실패시 어떤 모양으로 LLM 이 어겼는지 즉시 보임. 비용 0 (이미 메모리에 있는 객체).
+  // ── 4.5 sectionIds → slotBlockRefs 자동 매핑 (M3b-3 P10) ────
+  // LLM 은 sectionIds 만 박음. 코드가 그것을 풀어 슬롯에 박음.
+  // expandSectionIdsToSlots() 가 in-place 로 page.slotBlockRefs 채움.
+  // 검증·UI 흐름은 변경 없음 — 같은 형태로 채워지므로.
+  try {
+    expandSectionIdsToSlots(llmBook, input.manuscript, input.patterns);
+  } catch (e) {
+    // 자동 매핑 자체에서 throw 된 경우 (예: 다중 슬롯 콤포지션)
+    if (e instanceof PaginateError) throw e;
+    throw new PaginateError(
+      "REALIZE_FAILED",
+      `sectionIds 자동 매핑 실패: ${e instanceof Error ? e.message : "unknown"}`,
+      { cause: e },
+    );
+  }
+
+  // 진단 로그 — 페이지 수 + 첫 페이지의 sectionIds + 자동 매핑된 slotBlockRefs 형태.
+  // 검증 통과·실패 무관. 비용 0.
   console.log(
-    `[paginate] LLM 출력: pages=${llmBook.pages.length}, omissions=${llmBook.intentionalOmissions?.length ?? 0}, ` +
-      `p1.slotKeys=[${Object.keys(llmBook.pages[0]?.slotBlockRefs ?? {}).join(",")}], ` +
+    `[paginate] LLM 출력: pages=${llmBook.pages.length}, ` +
+      `p1.sectionIds=[${(llmBook.pages[0]?.sectionIds ?? []).join(",")}], ` +
       `p1.slotBlockCounts=${JSON.stringify(
         Object.fromEntries(
           Object.entries(llmBook.pages[0]?.slotBlockRefs ?? {}).map(([k, v]) => [
@@ -240,6 +257,105 @@ function validateInput(input: PaginateInput): void {
       "PATTERN_LIST_EMPTY",
       "입력 patterns 가 비어있습니다 (어휘에 매칭되는 콤포지션 0개일 가능성)",
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 자동 매핑 — sectionIds → slotBlockRefs (M3b-3 P10)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * LLM 출력의 각 페이지에 대해 sectionIds 를 해석하고 slotBlockRefs 를 자동으로 채움.
+ *
+ * 비유: LLM 은 "1페이지=표지섹션, 2페이지=PEG섹션..." 큰 그림만 결정.
+ * 이 함수가 "표지섹션의 어느 블록을 어느 슬롯에 박을지" 를 자동 처리.
+ *
+ * 처리 순서:
+ *   1) 각 페이지의 sectionIds 의 각 섹션에서 블록들을 순서대로 모음 (blocksInSection)
+ *   2) separator 블록 자동 제외
+ *   3) 콤포지션 슬롯 종류 보고 분배:
+ *      - 단일 슬롯 콤포지션 (full-text, full-image, full-image-bleed):
+ *        모든 텍스트 블록 → text 슬롯 / 첫 image 블록 → image 슬롯 / 첫 table → table
+ *        호환 안 되는 블록은 그냥 제외 (예: full-text 인데 manuscript 에 image 있는 경우 image 무시)
+ *      - 다중 슬롯 콤포지션: 1차에선 미박. P10 단계에선 단일 슬롯만 활성 어휘.
+ *        다중 슬롯 어휘 부활 시 (M2 본격) 별도 분배 로직 박아야 함.
+ *
+ * 부작용 (mutates):
+ *   - 입력 page 객체의 slotBlockRefs / hiddenSlotIds 를 박음.
+ *   - LlmBookOutput 자체 구조는 변경 없음 (검증·UI 흐름 그대로).
+ *
+ * 에러:
+ *   - sectionIds 안에 manuscript.sections 에 없는 ID 있으면 throw (검증에서 잡혀야 할 조기 차단).
+ *   - 다중 슬롯 콤포지션 만나면 throw (1차에선 단일 슬롯만 — 어휘 정책 §5.7).
+ */
+function expandSectionIdsToSlots(
+  book: LlmBookOutput,
+  manuscript: PaginateInput["manuscript"],
+  patterns: readonly CompositionPattern[],
+): void {
+  const sectionMap = new Map(manuscript.sections.map((s) => [s.id, s]));
+  const patternMap = new Map(patterns.map((p) => [p.slug, p]));
+
+  for (const page of book.pages) {
+    const pattern = patternMap.get(page.pattern);
+    if (!pattern) {
+      // 검증에서 PATTERN_NOT_FOUND 로 잡힘 — 여기서는 그냥 빈 매핑 박고 넘어감
+      page.slotBlockRefs = {};
+      continue;
+    }
+
+    // sectionIds 에 박힌 ID 들의 블록을 순서대로 모음
+    const collectedBlocks: Block[] = [];
+    for (const sectionId of page.sectionIds ?? []) {
+      const section = sectionMap.get(sectionId);
+      if (!section) {
+        // 검증에서 잡힘 — 빈 매핑 그대로
+        continue;
+      }
+      const sectionBlocks = blocksInSection(manuscript.blocks, section);
+      // separator 자동 제외
+      for (const b of sectionBlocks) {
+        if (b.type !== "separator") collectedBlocks.push(b);
+      }
+    }
+
+    // 콤포지션 슬롯 종류 보고 매핑
+    // 1차 정책: 단일 슬롯 콤포지션만 활성 (full-text, full-image, full-image-bleed)
+    if (pattern.slots.length !== 1) {
+      throw new PaginateError(
+        "REALIZE_FAILED",
+        `pageNumber=${page.pageNumber}: 콤포지션 '${page.pattern}' 의 슬롯 ${pattern.slots.length}개 — 1차에선 단일 슬롯만 지원 (default.md gridVocabulary 정책 §5.7). 다중 슬롯 어휘 부활은 M2 본격 작업 + sectionIds 분배 로직 박은 후.`,
+      );
+    }
+
+    const slot = pattern.slots[0];
+    const slotKind = slot.kind;
+    const matchingBlocks: string[] = [];
+
+    if (slotKind === "text") {
+      // text 슬롯 — heading/paragraph/list 모두 박음 (블록 ID 순서)
+      for (const b of collectedBlocks) {
+        if (b.type === "heading" || b.type === "paragraph" || b.type === "list") {
+          matchingBlocks.push(b.id);
+        }
+      }
+    } else if (slotKind === "image") {
+      // image 슬롯 — 첫 image 블록만 (image 슬롯은 1개 블록 정책)
+      const firstImage = collectedBlocks.find((b) => b.type === "image");
+      if (firstImage) matchingBlocks.push(firstImage.id);
+    } else if (slotKind === "table") {
+      // table 슬롯 — 첫 table 블록만
+      const firstTable = collectedBlocks.find((b) => b.type === "table");
+      if (firstTable) matchingBlocks.push(firstTable.id);
+    }
+    // chart / shape: 1차 미지원 (validate.ts isBlockKindCompatible 와 일관)
+
+    page.slotBlockRefs = { [slot.id]: matchingBlocks };
+    // 슬롯이 optional 인데 매핑 블록 0개면 hiddenSlotIds 로 처리
+    if (matchingBlocks.length === 0 && slot.optional) {
+      page.hiddenSlotIds = [slot.id];
+      page.slotBlockRefs = {};
+    }
   }
 }
 
@@ -426,8 +542,20 @@ function parseLlmOutput(toolInput: unknown): LlmBookOutput {
     );
   }
 
+  // sectionIds / slotBlockRefs 안전성 — LLM 이 sectionIds 박았어도 spectator 가 보면
+  // slotBlockRefs 가 undefined 일 수 있음 (스키마에서 LLM 이 박지 않으므로).
+  // 빈 객체로 초기화 — expandSectionIdsToSlots 가 곧 채움.
+  const pages = (obj.pages as Array<Record<string, unknown>>).map((p) => ({
+    ...p,
+    sectionIds: Array.isArray(p.sectionIds) ? p.sectionIds : [],
+    slotBlockRefs:
+      typeof p.slotBlockRefs === "object" && p.slotBlockRefs !== null
+        ? (p.slotBlockRefs as Record<string, string[]>)
+        : {},
+  })) as LlmPageOutput[];
+
   return {
-    pages: obj.pages as LlmPageOutput[],
+    pages,
     intentionalOmissions:
       (obj.intentionalOmissions as LlmBookOutput["intentionalOmissions"]) ??
       undefined,
