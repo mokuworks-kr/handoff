@@ -167,6 +167,15 @@ export async function POST(request: NextRequest) {
                   issues: e.validation.issues,
                 }
               : undefined,
+            // 검증 실패한 경우 LLM 이 실제 뭘 출력했는지 디버그 표본 (첫 3페이지).
+            // lab 전용 응답 — 본 라우트(/api/paginate)는 이 필드 없음.
+            llmRawSample: e.llmRaw
+              ? {
+                  totalPages: e.llmRaw.pages.length,
+                  firstPages: e.llmRaw.pages.slice(0, 3),
+                  intentionalOmissions: e.llmRaw.intentionalOmissions ?? [],
+                }
+              : undefined,
           },
           { status },
         );
