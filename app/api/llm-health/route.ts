@@ -1,3 +1,11 @@
+// 기존 import 아래에
+export const maxDuration = 30;
+export const runtime = "nodejs";
+
+export async function GET(request: NextRequest) {
+  // ... 기존 그대로
+}
+
 /**
  * LLM 헬스체크 — API 키 살아있고 호출 성공하는지.
  *
