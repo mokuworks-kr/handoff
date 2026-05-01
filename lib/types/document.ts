@@ -74,6 +74,31 @@
  *
  *    이 필드는 §A "확장 축"의 5번째 축(공유 어댑터)을 위한 사전 작업이다.
  *    1차 출시 시점에 박아두면 미래에 데이터 마이그레이션 비용 0.
+ *
+ * 10) Document.designTokens 는 "편집 가능한 인스턴스"
+ *     (M3a-3 메모, 미래 슬라이더/토글 UI 대비)
+ *
+ *     `public/design-md/<slug>.md` 의 카탈로그는 read-only. 그러나 새 프로젝트가
+ *     생성되는 시점에 그 내용이 Document.designTokens 로 *복사*된다. 이후 사용자가
+ *     슬라이더/토글로 정보 밀도·여백·폰트 크기·rhythmGuide 등을 조정하면 그 변경은
+ *     Document.designTokens 에만 반영되고 카탈로그는 안 건드린다.
+ *
+ *     즉:
+ *       public/design-md/default.md  (read-only 카탈로그, 모든 새 프로젝트의 시드)
+ *           ↓ 새 프로젝트 시 1회 복사
+ *       Document.designTokens         (mutable 인스턴스, 사용자 편집 결과)
+ *
+ *     이 구분이 흐려지지 않게:
+ *     - 카탈로그 변경(예: default.md 수정)은 *기존* 프로젝트에 영향 X. 새로 만든
+ *       프로젝트만 새 카탈로그를 시드로 받음. (사용자가 "최신 디자인 적용" 버튼을
+ *       명시적으로 누르면 Document.designTokens 를 카탈로그로 다시 덮어쓰는 것은
+ *       별개 동작 — 미래 결정.)
+ *     - origin.designSlug 는 "원본이 어디였는지" 추적용. designTokens 와 따로.
+ *     - 사용자 편집 슬라이더는 Document.designTokens 의 특정 필드를 직접 수정.
+ *       페이지네이션은 그 결과로 만들어진 designTokens 를 보고 동작.
+ *
+ *     사용자 편집 슬라이더 UI는 미래(M3c 또는 그 이후)에 박힘. 지금은 그 가능성을
+ *     깨지 않는 구조만 유지.
  */
 
 import type { DesignTokens } from "./design-tokens";
@@ -199,8 +224,8 @@ export type Page = {
  * 문서의 출처 정보.
  *
  * "이 문서가 어떤 디자인/콤포지션 카탈로그에서 시작했는지"의 메타데이터.
- * 사용자가 디자인을 편집하면 그 결과는 Document.styles 에 박히고, origin 은
- * 원본 추적 용도로만 남는다.
+ * 사용자가 디자인을 편집하면 그 결과는 Document.designTokens 에 박히고, origin 은
+ * 원본 추적 용도로만 남는다 (정책 9, 10 참조).
  *
  * 1차 출시: builtin 카탈로그만. source: "builtin" 고정.
  * 미래 커뮤니티 카탈로그: source: "community" + url + author.
@@ -244,6 +269,12 @@ export type Document = {
   /** 접지형일 때 */
   fold?: Fold;
 
+  /**
+   * 디자인 토큰 — 이 프로젝트의 *인스턴스*. mutable.
+   * 새 프로젝트 생성 시 카탈로그(public/design-md/<slug>.md)에서 1회 복사된 후
+   * 사용자 편집(슬라이더/토글, 미래 기능)에 의해 변경 가능.
+   * 자세한 내용은 헤더 정책 10번 참조.
+   */
   designTokens: DesignTokens;
 
   /**
