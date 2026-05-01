@@ -1,18 +1,16 @@
 /**
  * /projects/[id] — 프로젝트 상세 페이지.
  *
- * **임시 상태 (M3a-3 시점)**:
- *   M3b (페이지네이션 LLM)가 박힐 때까지 디자인 결과가 없음. 그래서:
- *   - 사용자에게 "원고가 잘 들어왔어요" 메시지
- *   - 작은 요약 (섹션 N개 인식, 형식 등) — 사용자에게 의미 있는 신호만
- *   - 분류 결과 디버그(ResultView)는 펼침으로 숨김 (선택적 표시)
- *   - "다음 단계 (디자인 생성)는 곧 추가됩니다" 안내
+ * **M3b-4 (2026-05) 갱신**:
+ *   페이지네이션 본 흐름 통합. ProjectPaginatePanel 클라이언트 컴포넌트가:
+ *   - DB 의 Document.pages 를 initialPages 로 받아 슬림 그리드 표시 (재방문 모드)
+ *   - "페이지 만들기"/"다시 만들기" 버튼 누르면 /api/paginate 호출
+ *   - 새 결과는 PaginateResultView 풀 표시 (메타 + LLM + 검증 + 그리드)
  *
- * M3b 박힐 때 이 페이지가:
- *   - 임시 메시지 → 실제 디자인 페이지 미리보기로 교체
- *   - ResultView 펼침 유지 (디자인 결과와 분류 결과를 같이 볼 수 있게)
+ * **이전 임시 상태 (M3a-3)**:
+ *   페이지네이션 미박이라 "원고가 잘 들어왔어요" 임시 안내. M3b-4 에서 제거.
  *
- * 미래 (M3c): 3-Pane 캔버스 + 자연어 편집이 박힘.
+ * 미래 (M3c): 3-Pane 캔버스 + 자연어 편집이 박힘. 슬림 그리드 → 풀 캔버스로 교체.
  */
 
 import { redirect, notFound } from "next/navigation";
@@ -22,6 +20,7 @@ import { Topbar } from "@/components/shared/topbar";
 import { Button } from "@/components/ui/button";
 import type { Profile, Project } from "@/lib/types";
 import { ResultView } from "@/components/classify/ResultView";
+import { ProjectPaginatePanel } from "./ProjectPaginatePanel";
 
 export const metadata = {
   title: "프로젝트 | Handoff",
@@ -57,10 +56,15 @@ export default async function ProjectDetailPage({ params }: { params: Params }) 
   const credits = profile?.credit_balance ?? 0;
   const email = profile?.email ?? user.email ?? "";
 
-  const manuscript = project.document.manuscript;
+  const document = project.document;
+  const manuscript = document.manuscript;
   const sectionCount = manuscript?.sections.length ?? 0;
   const blockCount = manuscript?.blocks.length ?? 0;
   const sourceFormat = manuscript?.source.format ?? "?";
+
+  // 페이지네이션 패널에 넘길 값 — DB에 박혀있는 pages 그대로
+  const initialPages = document.pages ?? [];
+  const colors = document.styles?.colors ?? [];
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -87,18 +91,26 @@ export default async function ProjectDetailPage({ params }: { params: Params }) 
           <SummaryCard label="섹션" value={String(sectionCount)} />
         </div>
 
-        {/* 임시 안내 — 다음 마일스톤 */}
-        <div className="border border-border rounded-xl bg-surface p-8 text-center space-y-3 mb-8">
-          <h2 className="text-lg font-medium">원고를 잘 받았어요</h2>
-          <p className="text-sm text-ink-600">
-            다음 단계(디자인 생성)는 곧 추가됩니다.
-            <br />
-            지금은 원고가 정확히 분석됐는지만 확인할 수 있어요.
-          </p>
-          <p className="text-xs text-ink-400">
-            마일스톤 M3b — 페이지네이션 LLM 작업 중
-          </p>
-        </div>
+        {/* 페이지네이션 패널 — 본 흐름 (M3b-4) */}
+        {manuscript ? (
+          <div className="mb-8">
+            <ProjectPaginatePanel
+              projectId={project.id}
+              format={document.format}
+              colors={colors}
+              initialPages={initialPages}
+            />
+          </div>
+        ) : (
+          // 매니스크립트 없는 프로젝트 — 분류 단계 미완 (이상 상황).
+          // M3a-3 이후로는 분류 후에만 프로젝트가 생성되므로 거의 안 일어남.
+          <div className="border border-border rounded-xl bg-surface p-8 text-center space-y-3 mb-8">
+            <h2 className="text-lg font-medium">원고를 먼저 분류해주세요</h2>
+            <p className="text-sm text-ink-600">
+              페이지를 만들려면 분류된 원고가 필요해요.
+            </p>
+          </div>
+        )}
 
         {/* 분류 결과 — 펼침으로 숨김 (디버그/검증용) */}
         {manuscript && (
@@ -117,7 +129,7 @@ export default async function ProjectDetailPage({ params }: { params: Params }) 
           <span>
             만든 날짜: {new Date(project.created_at).toLocaleString("ko-KR")}
           </span>
-          <span>스키마 v{project.document.schemaVersion}</span>
+          <span>스키마 v{document.schemaVersion}</span>
         </div>
       </main>
     </div>
