@@ -24,6 +24,7 @@ import {
   EMPTY_FOLDED_DOCUMENT,
   type Document,
 } from "@/lib/types/document";
+import { loadDesignTokens } from "@/lib/design-tokens/load";
 import { extractProjectTitle } from "./title";
 
 export type CreateProjectInput = {
@@ -45,7 +46,7 @@ export type CreateProjectResult = {
 };
 
 export class CreateProjectError extends Error {
-  readonly code: "INSERT_FAILED" | "INVALID_INPUT";
+  readonly code: "INSERT_FAILED" | "INVALID_INPUT" | "DESIGN_LOAD_FAILED";
   readonly cause?: unknown;
   constructor(code: CreateProjectError["code"], message: string, cause?: unknown) {
     super(message);
@@ -73,11 +74,43 @@ export async function createProject(
   const seedDoc: Document =
     artifactType === "folded" ? EMPTY_FOLDED_DOCUMENT : EMPTY_BOUND_DOCUMENT;
 
+  // 디자인 카탈로그 시드 (정책 §10) — public/design-md/<slug>.md 1회 복사.
+  // 이후 사용자 편집은 인스턴스(Document.designTokens)에만 반영.
+  // 카탈로그 자체(파일)는 read-only — 절대 수정 금지.
+  //
+  // 카탈로그 로드 실패는 throw — silent fallback (빈 designTokens) 은
+  // 페이지네이션 시점에 가서야 VOCABULARY_EMPTY 로 깨지는 디버깅 지옥을
+  // 만들었기 때문. 분류 시점에 즉시 거절하는 편이 진단·복구 모두 빠름.
+  // (이전 silent fallback 으로 박힌 옛 프로젝트가 lab/paginate 에서 깨진 사례
+  //  발견 후 변경 — 2026-05.)
+  let designTokens: Document["designTokens"];
+  let stylesPatch: Document["styles"];
+  try {
+    const loaded = await loadDesignTokens(designSlug);
+    designTokens = loaded;
+    // print 카탈로그를 Document.styles 에 1회 동기화 (정책 §10)
+    stylesPatch = {
+      paragraphStyles: loaded.print?.paragraphStyles ?? [],
+      characterStyles: loaded.print?.characterStyles ?? [],
+      colors: loaded.print?.colors ?? [],
+      fonts: loaded.print?.fonts ?? [],
+    };
+  } catch (e) {
+    throw new CreateProjectError(
+      "DESIGN_LOAD_FAILED",
+      `디자인 카탈로그 '${designSlug}' 로드 실패: ${e instanceof Error ? e.message : "unknown"}`,
+      e,
+    );
+  }
+
   const document: Document = {
     ...seedDoc,
+    designTokens,
+    styles: stylesPatch,
     manuscript: input.manuscript,
     origin: {
       designSlug,
+      designVersion: designTokens.version,
       source: "builtin",
       author: { id: "handoff-builtin", name: "Handoff" },
     },
