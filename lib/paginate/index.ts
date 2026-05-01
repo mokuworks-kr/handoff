@@ -170,6 +170,9 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
       rawCostUsd: toolOutput.rawCostUsd,
       stopReason: toolOutput.stopReason,
     },
+    // lab/디버그용 — 검증 통과한 LLM raw 출력. 본 라우트는 무시.
+    // rationale, slotBlockRefs, splitReason 등 LLM 의도 메타 보존.
+    llmRaw: llmBook,
     validation,
   };
 }
