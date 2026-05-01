@@ -79,10 +79,21 @@ import {
 // 진입점
 // ─────────────────────────────────────────────────────────────
 
-const MODEL_PAGINATE = "gemini-2.5-pro";
+// 1차 검증 단계 모델 정책 (M3b-3 박힘):
+//   gemini-2.5-flash. 어댑터(lib/llm/providers/gemini.ts)의 화이트리스트가 자동으로
+//   thinkingBudget=0 을 박아 thinking 비활성. 비용·속도 모두 pro 대비 큰 폭 개선.
+//
+// 왜 flash 인가 (시점 결정 박제):
+//   1) Vercel Hobby 플랜 60초 함수 한도. pro thinking + retry 합치면 timeout 위험.
+//   2) P7 에서 어휘를 [12] 단일 슬롯으로 좁힘 — thinking 없이도 충분한 결정.
+//   3) Gemini 503 OVERLOADED 발생률이 pro 대비 낮아 retry 후 통과 확률 높음.
+//
+// 추후 다중 슬롯 어휘 부활 시 (M2 본격 디자인 작업)
+//   - thinking 이 필요해지면 어댑터에 keepThinking 옵션 추가 후 flash + thinking 재활성, 또는
+//   - Vercel Pro 플랜 전환 후 pro 모델 복귀, 또는
+//   - LLM_PROVIDER=anthropic 으로 갈아타기 (Anthropic 결제 해결 후).
+const MODEL_PAGINATE = "gemini-2.5-flash";
 const MAX_OUTPUT_TOKENS = 32000; // 시드 30~40페이지 기준 충분 (page 당 ~500토큰 ×40 = 20K)
-// 주: gemini-2.5-pro 는 lib/llm/providers/gemini.ts 의 thinking 강제 화이트리스트 대상.
-// thinking 옵션을 별도로 박을 필요 없음 — 모델명만으로 어댑터가 처리.
 
 export async function paginateBook(input: PaginateInput): Promise<PaginateOutput> {
   // ── 1. 입력 검증 ────────────────────────────────────────────
@@ -98,8 +109,8 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   //
   // - provider 미지정 → 환경변수 LLM_PROVIDER (기본 anthropic 또는 gemini)
   // - model 미지정 → 어댑터의 기본 모델
-  //   페이지네이션은 reasoning 무거운 작업이라 명시적으로 gemini-2.5-pro 박음.
-  //   gemini-2.5-pro / 3.x-pro-preview 는 thinking 강제 화이트리스트라 별도 옵션 불필요.
+  //   페이지네이션은 1차 검증 단계에서 flash 명시 (위 정책 메모 참조).
+  //   어댑터가 flash 모델은 자동으로 thinking 비활성 처리.
   // - forceToolUse: true (분류기와 동일, 자유 텍스트 응답 안 받음)
   // - idempotencyKey: lib/llm 미지원. 라우트의 크레딧 차감 멱등성에서만 사용.
   const callToolFn = input.callTool ?? callTool;
@@ -116,6 +127,10 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
         input_schema: TOOL_SCHEMA.parameters,
       },
       maxTokens: MAX_OUTPUT_TOKENS,
+      // Vercel Hobby 60초 함수 한도 안전 마진. 어댑터 기본 3 (총 4시도, backoff 합 ~20초)
+      // 은 LLM 본 호출 시간과 합쳐 timeout 위험. 1로 줄여 총 2시도, backoff ~500ms.
+      // 503 등 일시적 장애 시 사용자가 다시 누르는 흐름으로.
+      maxRetries: 1,
       forceToolUse: true,
       callerLabel: input.callerLabel ?? "paginate-book",
     });
