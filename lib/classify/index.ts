@@ -15,15 +15,11 @@
  * 4) 검증: ID 실재, 겹침 없음, 정렬, kind enum 유효
  * 5) ClassifiedManuscript 반환 (원본 normalized + sections)
  *
- * 호출 단가 (시드 회사소개서 ~46블록 기준): 약 $0.06 (~80원)
- * 캐시 활성화 후 두 번째 호출: 약 $0.02 (~30원)
+ * 모델/프로바이더는 환경변수 LLM_PROVIDER 로 결정 (기본 "gemini").
+ * 미래에 Anthropic 결제 풀리면 LLM_PROVIDER=anthropic 으로 즉시 전환.
  */
 
-import {
-  type CallToolInput,
-  callTool,
-} from "@/lib/anthropic/call";
-import { MODELS } from "@/lib/anthropic/client";
+import { callTool } from "@/lib/llm";
 import type { Block, NormalizedManuscript } from "@/lib/parsers/normalized";
 import {
   type ClassifiedManuscript,
@@ -54,9 +50,8 @@ export async function classifyManuscript(
   // 블록을 LLM이 읽기 좋은 평문으로
   const userMessage = serializeBlocksForLlm(normalized.blocks);
 
-  // tool 호출
+  // tool 호출 — model 미지정 시 프로바이더 어댑터의 기본 모델 사용
   const result = await callTool<{ sections: LlmSectionOutput[] }>({
-    model: MODELS.primary,
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: userMessage }],
     tool: {
@@ -97,7 +92,8 @@ export async function classifyManuscript(
 /**
  * 분류기 정책을 LLM에게 학습시키는 프롬프트.
  *
- * 길이 4000자 이상이면 자동 캐싱. 같은 사용자가 연속으로 분류 돌리면 cache hit.
+ * 길이 4000자 이상이면 Anthropic은 자동 캐싱 (어댑터에서 처리).
+ * Gemini는 1차에서 캐싱 미적용.
  *
  * 의도적으로 한국어로 작성 — 1차 타깃이 한국 비즈니스 시나리오라 예시도 한국어로.
  * 영어 원고 들어와도 동작 (LLM이 다언어).
