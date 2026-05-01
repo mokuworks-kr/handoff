@@ -1,41 +1,30 @@
 /**
  * /api/classify-and-create — production 입력 라우트.
  *
- * /lab/classify (검증·튜닝용)와 분리된 production 라우트.
+ * 입력 방식 (M3a-3-2c 변경):
+ *   - 파일 직접 업로드 ❌ (Vercel 4.5MB 한도)
+ *   - Storage 경로 받기 ✅ (클라이언트가 미리 Storage에 직접 업로드)
+ *   - 텍스트 입력은 그대로 (작아서 body로 보내도 됨)
  *
  * 흐름:
- *   1) 인증 (모든 로그인 사용자, 화이트리스트 X)
- *   2) 잔액 사전 체크 — MIN_CREDIT_BALANCE_FOR_CLASSIFY 미만이면 즉시 402
- *   3) 파일/텍스트 파싱 → NormalizedManuscript
- *   4) 분류기 호출 → ClassifiedManuscript (LLM 호출, 비용 발생)
- *   5) 프로젝트 생성 (Project row + Document 시드 + manuscript + origin)
- *   6) 크레딧 차감 (분류 비용 → 정수 크레딧)
+ *   1) 인증 (모든 로그인 사용자)
+ *   2) 잔액 체크 — MIN_CREDIT_BALANCE_FOR_CLASSIFY
+ *   3) 입력 분기:
+ *      - storagePath → admin client 로 Storage 다운로드 → 파싱
+ *      - text → 직접 파싱
+ *   4) 분류기 호출 → ClassifiedManuscript
+ *   5) 프로젝트 생성
+ *   6) 크레딧 차감
  *   7) projectId 반환
  *
- * 차감 시점 결정 (Q1 추천):
- *   - 분류 호출 *후*, 실제 토큰 기반 정확 차감
- *   - 사전에는 MIN_CREDIT_BALANCE_FOR_CLASSIFY 만 체크
- *   - 분류 실패 시 차감 안 함 (당연)
- *   - 프로젝트 생성 실패 시: 분류는 했지만 결과를 못 살림 → 차감도 하지 않는 게 사용자에게 유리.
- *     단 LLM 비용은 이미 발생. 검증 단계라 작아 무시. 미래에 보정 필요하면 admin 통계로 추적.
- *
- * 멱등성:
- *   - idempotency_key = "classify:{projectId}"
- *   - 같은 프로젝트에 대해 두 번 차감 안 됨 (deduct_credits PG 함수가 보장)
- *   - 단 사용자가 같은 파일을 두 번 업로드하면 두 프로젝트가 생성됨 (이건 정상 — 별 케이스)
- *
- * 에러 코드 (status):
- *   401 — 비로그인
- *   402 — 잔액 부족
- *   400 — 입력 누락
- *   413 — 파일 큼 (Vercel 함수가 라우트 도달 전 차단)
- *   422 — 파싱 실패
- *   502 — LLM 호출 실패
- *   500 — 기타
+ * Storage 경로 검증:
+ *   - 클라이언트가 보낸 path가 user_id 로 시작하는지 확인 (다른 사용자 파일 접근 차단)
+ *   - admin client 는 RLS 우회하므로 이 검증이 필수
  */
 
 import { NextResponse, type NextRequest } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { parseManuscript, ManuscriptParseError } from "@/lib/parsers";
 import { classifyManuscript } from "@/lib/classify";
 import { LlmCallError } from "@/lib/llm";
@@ -81,45 +70,82 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 3) 입력 파싱
-    let formData: FormData;
+    // 3) 입력 — JSON body
+    let body: {
+      storagePath?: string;
+      filename?: string;
+      text?: string;
+      title?: string;
+      artifactType?: "bound" | "folded";
+    };
     try {
-      formData = await request.formData();
+      body = await request.json();
     } catch (e) {
-      console.error("[classify-and-create] formData parse failed", e);
-      return NextResponse.json({ error: "invalid form data" }, { status: 400 });
+      console.error("[classify-and-create] body parse failed", e);
+      return NextResponse.json({ error: "invalid json" }, { status: 400 });
     }
-
-    const file = formData.get("file");
-    const text = formData.get("text");
-    const filenameField = formData.get("filename");
-    const titleField = formData.get("title"); // 사용자가 명시적으로 제목 입력 시
-    const artifactTypeField = formData.get("artifactType"); // "bound" | "folded"
 
     let normalized;
     try {
-      if (file && file instanceof File) {
+      if (body.storagePath) {
+        // 경로 검증 — user_id 로 시작해야 함 (다른 사용자 파일 접근 차단)
+        const expectedPrefix = `${user.id}/`;
+        if (!body.storagePath.startsWith(expectedPrefix)) {
+          console.warn(
+            `[classify-and-create] path traversal attempt user=${user.id} path=${body.storagePath}`,
+          );
+          return NextResponse.json(
+            { error: "invalid storage path", code: "INVALID_PATH" },
+            { status: 403 },
+          );
+        }
+
+        // Storage 에서 다운로드 (admin client — RLS 우회)
+        const admin = createAdminClient();
+        const { data: blob, error: dlError } = await admin.storage
+          .from("originals")
+          .download(body.storagePath);
+
+        if (dlError || !blob) {
+          console.error(
+            "[classify-and-create] storage download failed",
+            dlError,
+            body.storagePath,
+          );
+          return NextResponse.json(
+            {
+              error: "storage download failed",
+              code: "DOWNLOAD_FAILED",
+              message: dlError?.message,
+            },
+            { status: 500 },
+          );
+        }
+
+        const buffer = await blob.arrayBuffer();
+        // filename 추출 — body.filename 우선, 없으면 storagePath의 마지막 세그먼트
+        const filename =
+          body.filename ?? body.storagePath.split("/").pop() ?? "uploaded";
         console.log(
-          `[classify-and-create] file user=${user.id.slice(0, 8)} name=${file.name} size=${file.size}`,
+          `[classify-and-create] storage user=${user.id.slice(0, 8)} path=${body.storagePath} size=${buffer.byteLength}`,
         );
-        const buffer = await file.arrayBuffer();
         normalized = await parseManuscript({
           kind: "file",
           buffer,
-          filename: file.name,
+          filename,
         });
-      } else if (typeof text === "string" && text.length > 0) {
+      } else if (typeof body.text === "string" && body.text.length > 0) {
         console.log(
-          `[classify-and-create] text user=${user.id.slice(0, 8)} len=${text.length}`,
+          `[classify-and-create] text user=${user.id.slice(0, 8)} len=${body.text.length}`,
         );
         normalized = await parseManuscript({
           kind: "text",
-          content: text,
-          filename: typeof filenameField === "string" ? filenameField : undefined,
+          content: body.text,
+          filename: body.filename,
         });
       } else {
         return NextResponse.json(
-          { error: "file or text required" },
+          { error: "storagePath or text required" },
           { status: 400 },
         );
       }
@@ -173,11 +199,10 @@ export async function POST(request: NextRequest) {
     // 5) 프로젝트 생성
     let project;
     try {
-      const artifactType =
-        artifactTypeField === "folded" ? "folded" : "bound";
+      const artifactType = body.artifactType === "folded" ? "folded" : "bound";
       const userTitle =
-        typeof titleField === "string" && titleField.trim().length > 0
-          ? titleField.trim()
+        typeof body.title === "string" && body.title.trim().length > 0
+          ? body.title.trim()
           : undefined;
       project = await createProject({
         supabase,
@@ -201,8 +226,6 @@ export async function POST(request: NextRequest) {
     }
 
     // 6) 크레딧 차감
-    // 차감 실패해도 프로젝트는 이미 생성된 상태. 차감 실패는 시스템 에러로 로깅하되
-    // 사용자 응답은 성공으로 (프로젝트 ID 반환). 차감 실패는 admin 추적용.
     if (classified.classification) {
       const cost = classified.classification.rawCostUsd;
       const credits = usdToCredits(cost);
@@ -227,8 +250,6 @@ export async function POST(request: NextRequest) {
           "[classify-and-create] deduct failed (project already created)",
           e,
         );
-        // 차감 실패는 사용자 응답에 반영 안 함. 프로젝트는 이미 만들어졌고
-        // 사용자는 다음 단계로 갈 수 있어야 함. admin 통계에서 추적.
         if (!(e instanceof DeductCreditsError)) {
           // 알려지지 않은 에러 — 그래도 프로젝트는 살아있음
         }
