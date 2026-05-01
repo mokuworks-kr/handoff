@@ -101,7 +101,7 @@ export async function POST(request: NextRequest) {
     // 4) 프로젝트 조회 + ownership + manuscript 존재
     const { data: project, error: projectError } = await supabase
       .from("projects")
-      .select("id, owner_id, document")
+      .select("id, user_id, document")
       .eq("id", projectId)
       .single();
 
@@ -111,7 +111,7 @@ export async function POST(request: NextRequest) {
         { status: 404 },
       );
     }
-    if (project.owner_id !== user.id) {
+    if (project.user_id !== user.id) {
       return NextResponse.json(
         { error: "forbidden", code: "FORBIDDEN" },
         { status: 403 },
