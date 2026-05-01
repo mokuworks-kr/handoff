@@ -15,8 +15,8 @@
 
 import type {
   CallToolInput,
-  CallToolOutput,
-} from "@/lib/llm/call-tool";
+  CallToolResult,
+} from "@/lib/llm";
 import type { ClassifiedManuscript } from "@/lib/classify/types";
 import type { DesignTokens } from "@/lib/types/design-tokens";
 import type { Document } from "@/lib/types/document";
@@ -61,7 +61,16 @@ const DEFAULT_TOKENS: DesignTokens = {
   gridVocabulary: [[12], [6, 6], [8, 4], [4, 4, 4], [3, 3, 3, 3]],
   rhythmGuide: "차분한 호흡",
   print: {
-    paragraphStyles: [{ id: "body", name: "본문" }],
+    paragraphStyles: [
+      {
+        id: "body",
+        name: "본문",
+        fontFamily: "Pretendard",
+        fontSize: 10.5,
+        lineHeight: 1.6,
+        alignment: "left",
+      },
+    ],
     characterStyles: [],
     fonts: [],
     colors: [],
@@ -97,14 +106,23 @@ const PATTERNS = getPatternsForVocabulary(DEFAULT_TOKENS.gridVocabulary!);
 
 function makeCallToolMock(
   response: LlmBookOutput,
-): (input: CallToolInput) => Promise<CallToolOutput> {
-  return async (_input: CallToolInput) => ({
-    toolInput: response,
+): <TInput extends Record<string, unknown>>(
+  input: CallToolInput<TInput>,
+) => Promise<CallToolResult<TInput>> {
+  return async <TInput extends Record<string, unknown>>(
+    _input: CallToolInput<TInput>,
+  ): Promise<CallToolResult<TInput>> => ({
+    output: response as unknown as TInput,
+    provider: "gemini",
     model: "gemini-2.5-pro-mock",
-    inputTokens: 5000,
-    outputTokens: 800,
+    usage: {
+      inputTokens: 5000,
+      outputTokens: 800,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    },
     rawCostUsd: 0.0143,
-    stopReason: "stop",
+    stopReason: "tool_use",
   });
 }
 
@@ -127,6 +145,7 @@ function fail(label: string, message: string): never {
 // Test 1
 // ─────────────────────────────────────────────────────────────
 
+(async () => {
 console.log("Test 1: 입력 검증");
 {
   // INPUT_INVALID
@@ -320,3 +339,5 @@ console.log("\nTest 5: intentionalOmissions 명시 → 통과");
 }
 
 console.log("\n전체 5개 테스트 모두 통과.");
+
+})();
