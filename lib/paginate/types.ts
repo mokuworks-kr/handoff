@@ -300,17 +300,23 @@ export class PaginateError extends Error {
     | "UNKNOWN";
   readonly cause?: unknown;
   readonly validation?: ValidationResult;
+  /**
+   * 검증 실패 시점의 LLM raw 출력. 디버그용 (lab 라우트가 응답에 포함 가능).
+   * VALIDATION_FAILED 케이스에만 박힘 — 어떤 형태로 어겼는지 즉시 분석 가능.
+   */
+  readonly llmRaw?: LlmBookOutput;
 
   constructor(
     code: PaginateError["code"],
     message: string,
-    options: { cause?: unknown; validation?: ValidationResult } = {},
+    options: { cause?: unknown; validation?: ValidationResult; llmRaw?: LlmBookOutput } = {},
   ) {
     super(message);
     this.name = "PaginateError";
     this.code = code;
     this.cause = options.cause;
     this.validation = options.validation;
+    this.llmRaw = options.llmRaw;
   }
 }
 
