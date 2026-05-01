@@ -5,69 +5,96 @@
  * 카탈로그 구성 (M3b-1)
  * ─────────────────────────────────────────────────────────────
  *
- * default.md 어휘 [[12], [6,6], [8,4]] 안의 콤포지션 6개:
+ * default.md 어휘 [[12], [6,6], [8,4], [4,4,4], [3,3,3,3]] 안의 콤포지션 10개:
  *
- *   비율 [12]  — grid-12-text       (텍스트 풀폭)
- *              grid-12-image       (이미지 풀블리드)
- *   비율 [6,6] — grid-6-6-text-text  (텍스트 두 단)
- *              grid-6-6-text-image  (텍스트 + 이미지 균등)
- *   비율 [8,4] — grid-8-4-text-image (넓은 텍스트 + 좁은 이미지) ★ variants
- *              grid-8-4-table-text  (넓은 표 + 좁은 캡션)        ★ variants
+ *   비율 [12]        — full-text                       (텍스트 풀폭)
+ *                    full-image                       (이미지 풀블리드)
+ *   비율 [6,6]       — halves-text-text                (두 단 텍스트)
+ *                    halves-text-image                (텍스트 + 이미지 균등)
+ *   비율 [8,4]       — wide-narrow-text-image  ★ var  (제품 카탈로그 케이스)
+ *                    wide-narrow-table-text   ★ var  (재무제표 + 캡션)
+ *   비율 [4,4,4]     — thirds-text-text-text           (비전/미션/가치)
+ *                    thirds-image-image-image         (제품 3개 사진)
+ *   비율 [3,3,3,3]   — quarters-text-text-text-text    (분기별 실적, 4단계)
+ *                    quarters-image-image-image-image (임원 4명, 시설 4개)
  *
- * §11 약속 1번 (어휘는 책 단위 고정) 부합:
- *   각 콤포지션은 어휘의 한 비율에 매칭. 같은 비율의 여러 콤포지션은 슬롯 종류 차이로
- *   다양화 (§11 약속 2번 — "다양성은 슬롯 안 콘텐츠로").
+ * ★ var = asymmetryDirection variants (wide-left / wide-right) 보유.
  *
- * §16.5 동적 주입 정책 부합:
- *   페이지네이션 LLM (M3b-2) 호출 시 이 카탈로그가 user message 로 주입됨.
- *   디자인이 늘어도 (§16.8 시나리오) 프롬프트는 1개 그대로.
+ * ─────────────────────────────────────────────────────────────
+ * 슬러그 명명 정책 (의미적)
+ * ─────────────────────────────────────────────────────────────
  *
- * §16.6 후보 좁히기 부합:
- *   getPatternsForVocabulary() 가 어휘로 1차 좁힘.
- *   getPatternsByRole() 가 role 로 2차 좁힘.
+ * 슬러그가 비율 숫자가 아니라 의미("full", "halves", "wide-narrow", "thirds",
+ * "quarters")로 박힘. 디버깅 로그/LLM 출력에서 슬러그만 봐도 페이지 모양 즉시 잡힘.
+ *
+ * 1차 시스템은 default.md 어휘 안의 비율(정수 배열)을 직접 사용.
+ * 미래에 다른 columns 그리드(예: 8단/16단)를 받으려면 그 시점에 일반화 검토.
+ * 1차에 안 박는 이유 — YAGNI + §3/§14 ("1차는 default.md 만으로 진행").
+ *
+ * ─────────────────────────────────────────────────────────────
+ * 박힌 결정 부합
+ * ─────────────────────────────────────────────────────────────
+ *
+ * §11 약속 1번 (어휘는 책 단위 고정): 모든 콤포지션이 default 어휘의 한 비율과 매칭.
+ *   같은 비율의 여러 콤포지션은 슬롯 종류 차이로 다양화 (§11 약속 2번).
+ *
+ * §16.5 동적 주입 정책: 페이지네이션 LLM (M3b-2) 호출 시 이 카탈로그가 user message
+ *   로 주입됨. 디자인이 늘어도 (§16.8 시나리오) 프롬프트는 1개 그대로.
+ *
+ * §16.6 후보 좁히기: getPatternsForVocabulary() 가 어휘로 1차 좁힘.
+ *   getPatternsByRole() 가 role 로 2차 좁힘. 결과는 5~7개 (§16.6 범위 안).
  *
  * ─────────────────────────────────────────────────────────────
  * 미래 확장
  * ─────────────────────────────────────────────────────────────
  *
  * 1차 시드 5개 검증 후 부족한 조합이 발견되면 추가:
- *   - 풀폭 표 (grid-12-table) — 큰 표가 페이지를 가득 채우는 IR 케이스
- *   - 텍스트 + 차트 (grid-6-6-text-chart, grid-8-4-text-chart)
- *   - 이미지 + 표 (grid-6-6-image-table)
- *   - 새 비율 (grid-9-3, grid-7-5 등) — 디자이너 스타일 확장 시
+ *   - 슬롯 혼합 (thirds-image-text-image, halves-image-text 등)
+ *   - 표/차트 조합 (full-table, halves-text-chart)
+ *   - 비대칭 3슬롯 이상 ([6,3,3], [4,4,2,2] — 새 어휘 + 콤포지션)
+ *   - 새 columns 그리드 (8단/16단/6단) — 시스템 일반화 작업 필요
  *
  * 추가 시 코드 변경:
  *   1) 새 패턴 파일 추가 (lib/layout/patterns/<slug>.ts)
  *   2) 이 파일의 ALL_PATTERNS 배열에 한 줄 추가
+ *   3) (새 어휘 비율이면) default.md gridVocabulary 에 추가
  *   끝.
  */
 
 import type { CompositionPattern } from "@/lib/layout/composition";
 
-import { grid12Text } from "./grid-12-text";
-import { grid12Image } from "./grid-12-image";
-import { grid66TextText } from "./grid-6-6-text-text";
-import { grid66TextImage } from "./grid-6-6-text-image";
-import { grid84TextImage } from "./grid-8-4-text-image";
-import { grid84TableText } from "./grid-8-4-table-text";
+import { fullText } from "./full-text";
+import { fullImage } from "./full-image";
+import { halvesTextText } from "./halves-text-text";
+import { halvesTextImage } from "./halves-text-image";
+import { wideNarrowTextImage } from "./wide-narrow-text-image";
+import { wideNarrowTableText } from "./wide-narrow-table-text";
+import { thirdsTextTextText } from "./thirds-text-text-text";
+import { thirdsImageImageImage } from "./thirds-image-image-image";
+import { quartersTextTextTextText } from "./quarters-text-text-text-text";
+import { quartersImageImageImageImage } from "./quarters-image-image-image-image";
 
 // ─────────────────────────────────────────────────────────────
 // 카탈로그
 // ─────────────────────────────────────────────────────────────
 
 /**
- * 1차 패턴 6개 — 어휘 [[12], [6,6], [8,4]] 안에서 슬롯 종류 조합으로 다양화.
+ * 1차 패턴 10개.
  *
  * 이 배열의 순서는 페이지네이션 LLM 의 카탈로그 표시 순서로 사용됨.
- * 가독성: 비율 → 슬롯 종류 순.
+ * 가독성: 비율 단순 → 복잡 순 (full → halves → wide-narrow → thirds → quarters).
  */
 export const ALL_PATTERNS: readonly CompositionPattern[] = [
-  grid12Text,
-  grid12Image,
-  grid66TextText,
-  grid66TextImage,
-  grid84TextImage,
-  grid84TableText,
+  fullText,
+  fullImage,
+  halvesTextText,
+  halvesTextImage,
+  wideNarrowTextImage,
+  wideNarrowTableText,
+  thirdsTextTextText,
+  thirdsImageImageImage,
+  quartersTextTextTextText,
+  quartersImageImageImageImage,
 ];
 
 /**
@@ -85,10 +112,12 @@ export function findPatternBySlug(slug: string): CompositionPattern | undefined 
  * 비율 배열을 정규화된 키 문자열로.
  *
  * 같은 비율을 다른 순서로 쓴 케이스를 같은 비율로 매칭하기 위함.
- *   [8, 4]  → "4-8"
- *   [4, 8]  → "4-8"   (같은 비율로 인식)
- *   [12]    → "12"
- *   [6, 6]  → "6-6"
+ *   [8, 4]      → "4-8"
+ *   [4, 8]      → "4-8"   (같은 비율로 인식)
+ *   [12]        → "12"
+ *   [6, 6]      → "6-6"
+ *   [4, 4, 4]   → "4-4-4"
+ *   [3, 3, 3, 3] → "3-3-3-3"
  *
  * 정렬 기준: 오름차순. 단순한 비교가 가능.
  *
@@ -104,29 +133,28 @@ function normalizeVocabularyRatio(ratio: readonly number[]): string {
  * CompositionPattern 의 슬롯에서 비율을 추론.
  *
  * 패턴 정의 자체에는 "비율" 필드가 없고 슬롯의 columnSpan 합으로 결정됨.
- * 단 풀블리드 슬롯은 columns 안 차지하므로 제외.
+ * 단 풀블리드 슬롯은 columns 안 차지하므로 [12] 풀폭 의미로 처리.
  *
  * 예:
- *   grid-12-text   → slots[main].columnSpan=12       → [12]
- *   grid-6-6-*     → 6 + 6                            → [6, 6]
- *   grid-8-4-*     → 8 + 4                            → [8, 4]
- *   grid-12-image  → bleedToEdge → 슬롯이 columns 안 차지함 → [12] 로 간주 (풀폭 의미)
+ *   full-text                       → slots[main].columnSpan=12       → [12]
+ *   halves-*                        → 6 + 6                            → [6, 6]
+ *   wide-narrow-*                   → 8 + 4                            → [8, 4]
+ *   thirds-*                        → 4 + 4 + 4                        → [4, 4, 4]
+ *   quarters-*                      → 3 + 3 + 3 + 3                    → [3, 3, 3, 3]
+ *   full-image  (bleedToEdge)       → 슬롯이 columns 안 차지함        → [12] (풀폭)
  *
  * 풀블리드는 어휘상 풀폭과 같은 의미 (페이지 전체 사용) 이므로 [12] 비율로 매칭.
- * 이게 정책상 자연스러움 — gridVocabulary 는 본문 영역의 분할 비율인데,
+ * 정책상 자연스러움 — gridVocabulary 는 본문 영역의 분할 비율인데,
  * 풀블리드는 본문 영역을 분할 안 하고 전체를 씀.
  */
 function inferPatternRatio(pattern: CompositionPattern): number[] {
-  // 풀블리드 슬롯이 하나라도 있으면 그것이 페이지 전체를 차지 → [12] 로 간주
   const hasBleed = pattern.slots.some((s) => s.bleedToEdge);
   if (hasBleed) return [12];
 
-  // 그 외에는 슬롯들의 columnSpan 합으로 비율 추론.
-  // 같은 row 의 슬롯들만 합쳐야 정확한데, 1차 콤포지션은 모두 row 1 ~ -1 풀높이라
-  // 단순 합으로 충분. 미래에 row 변형이 박히면 row 그룹별로 합산하도록 확장.
+  // 슬롯들의 columnSpan 합으로 비율 추론. 1차 콤포지션은 모두 row 1 ~ -1 풀높이라 단순.
   const spans = pattern.slots
     .map((s) => s.area.columnSpan)
-    .filter((s) => s !== -1); // -1 은 "남은 칸 전부" — 1차 콤포지션엔 없음
+    .filter((s) => s !== -1); // -1 은 1차 콤포지션엔 없음 (방어적)
 
   return spans;
 }
@@ -144,15 +172,13 @@ function inferPatternRatio(pattern: CompositionPattern): number[] {
  * @returns 어휘에 등장하는 비율과 매칭되는 콤포지션들
  *
  * 예:
- *   getPatternsForVocabulary([[12], [6,6], [8,4]])
- *     → ALL_PATTERNS 6개 모두 (1차 카탈로그가 정확히 이 어휘에 맞춰 박힘)
+ *   getPatternsForVocabulary([[12], [6,6], [8,4], [4,4,4], [3,3,3,3]])
+ *     → ALL_PATTERNS 10개 모두 (1차 카탈로그가 정확히 default 어휘에 맞춰 박힘)
  *
- *   getPatternsForVocabulary([[12], [4,4,4]])
- *     → [grid-12-text, grid-12-image] 만 (4-4-4 매칭 패턴 없음)
- *     → 미래 디자인이 [4,4,4] 어휘를 쓰려면 grid-4-4-4-* 콤포지션 추가 필요
+ *   getPatternsForVocabulary([[12], [6,6]])
+ *     → 4개 (full-text, full-image, halves-text-text, halves-text-image)
  *
  * 어휘에 매칭되는 패턴이 0개인 비율이 있으면 콘솔 경고.
- * 페이지네이션이 그 비율을 못 쓰는 상황이라 디자인 정의 점검 필요.
  */
 export function getPatternsForVocabulary(
   vocabulary: readonly (readonly number[])[],
@@ -168,7 +194,6 @@ export function getPatternsForVocabulary(
     }
   }
 
-  // 디버깅 보조 — 어휘에 매칭되는 콤포지션 0개인 비율 찾기
   for (const ratio of vocabulary) {
     const key = normalizeVocabularyRatio(ratio);
     const hasMatch = matched.some(
@@ -187,22 +212,20 @@ export function getPatternsForVocabulary(
 /**
  * role 기반 2차 좁히기 (§16.6).
  *
- * 페이지 1장 만들 때 부름. LLM 이 페이지 의도(role)를 결정한 후
- * 그 role 의 콤포지션만 후보로 좁힘.
+ * 페이지 1장 만들 때 부름. LLM 이 페이지 의도(role)를 결정한 후 그 role 의
+ * 콤포지션만 후보로 좁힘.
  *
  * @param role             페이지 의도
  * @param vocabularyPatterns getPatternsForVocabulary() 결과 또는 임의 패턴 리스트
  * @returns 매칭 패턴들
  *
- * 1차 카탈로그 6개의 role 분포:
- *   body    : grid-12-text, grid-6-6-text-text, grid-8-4-text-image
- *   media   : grid-12-image, grid-6-6-text-image
- *   data    : grid-8-4-table-text
- *   cover / section-opener / closing: 1차 미박. body 또는 media 콤포지션을 재사용.
- *
- * cover/section-opener/closing 이 미박인 이유: 같은 grid-12-text 가 표지·장 시작·
- * 마무리에도 충분 (콘텐츠 다양성으로 차별화). 미래에 표지 전용 변형이 필요해지면
- * 그때 추가.
+ * 1차 카탈로그 10개의 role 분포:
+ *   body    : full-text, halves-text-text, wide-narrow-text-image,
+ *             thirds-text-text-text, quarters-text-text-text-text         (5개)
+ *   media   : full-image, halves-text-image,
+ *             thirds-image-image-image, quarters-image-image-image-image  (4개)
+ *   data    : wide-narrow-table-text                                       (1개)
+ *   cover / section-opener / closing: 1차 미박. body 또는 media 콤포지션 재사용.
  */
 export function getPatternsByRole(
   role: CompositionPattern["role"],
@@ -217,7 +240,7 @@ export function getPatternsByRole(
 
 /**
  * 패턴 슬러그가 카탈로그에 실재하는지.
- * 페이지네이션 LLM 출력 검증 시 사용 (M3b-2/M3b-3 에서).
+ * 페이지네이션 LLM 출력 검증 시 사용 (M3b-2/M3b-3).
  */
 export function isPatternSlugValid(slug: string): boolean {
   return ALL_PATTERNS.some((p) => p.slug === slug);
@@ -226,9 +249,6 @@ export function isPatternSlugValid(slug: string): boolean {
 /**
  * 패턴이 어휘 안에 있는지.
  * 페이지네이션 LLM 출력 검증 시 사용 — LLM 이 어휘 밖 패턴을 골랐는지 잡음.
- *
- * @param slug        검사할 패턴 slug
- * @param vocabulary  DesignTokens.gridVocabulary
  */
 export function isPatternInVocabulary(
   slug: string,
@@ -246,10 +266,14 @@ export function isPatternInVocabulary(
 // ─────────────────────────────────────────────────────────────
 
 export {
-  grid12Text,
-  grid12Image,
-  grid66TextText,
-  grid66TextImage,
-  grid84TextImage,
-  grid84TableText,
+  fullText,
+  fullImage,
+  halvesTextText,
+  halvesTextImage,
+  wideNarrowTextImage,
+  wideNarrowTableText,
+  thirdsTextTextText,
+  thirdsImageImageImage,
+  quartersTextTextTextText,
+  quartersImageImageImageImage,
 };
