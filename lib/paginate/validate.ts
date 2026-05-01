@@ -486,6 +486,9 @@ function validateBlockUsage(
   }
 
   // BLOCK_ORPHANED — 사용 안 됐고 누락도 명시 안 됨
+  // intentionalOmissions 는 1차 검증 단계 (M3b-3 P9) 에서 schema 에서 제거됨.
+  // 다만 omittedIds.has() 체크는 안전망으로 보존 — LLM 이 (스키마 외라도) 출력하면
+  // 허용해줌. 검증 코드는 그 케이스에 깨지지 않음.
   for (const block of blocks) {
     if (block.type === "separator") continue;
     const used = (usageCount.get(block.id) ?? 0) > 0;
@@ -494,7 +497,7 @@ function validateBlockUsage(
     issues.push({
       severity: "error",
       code: "BLOCK_ORPHANED",
-      message: `블록 ${block.id} (type=${block.type}) 가 어떤 페이지에도 없고 intentionalOmissions 에도 없음 — §1 약속 위반 (침묵 누락 금지)`,
+      message: `블록 ${block.id} (type=${block.type}) 가 어떤 페이지의 slotBlockRefs 에도 박혀있지 않음 — §1 약속 위반 (모든 콘텐츠 블록은 페이지 슬롯에 박혀야 함)`,
       blockId: block.id,
     });
   }
