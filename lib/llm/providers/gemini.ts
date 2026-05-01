@@ -6,7 +6,7 @@
  * 책임:
  *   1) Gemini API 호출 (ai.models.generateContent)
  *   2) FunctionCallingConfigMode.ANY 로 tool 호출 강제
- *   3) thinking 모델 처리 (모델별 조건부 — 일부 모델은 thinking 강제)
+ *   3) thinking 모델 처리 (모델별 화이트리스트 — 일부 모델은 thinking 강제)
  *   4) 재시도 (3회 exp backoff)
  *   5) 에러를 LlmCallError로 통일
  *   6) 토큰/비용 추적
@@ -19,13 +19,14 @@
  * 2) **Tool 강제**: Anthropic은 tool_choice. Gemini는 toolConfig.functionCallingConfig.mode = ANY.
  * 3) **Tool 출력 추출**: Anthropic은 content blocks 배열에서 tool_use. Gemini는 functionCalls 배열.
  * 4) **JSON Schema**: Gemini는 JSON Schema의 일부만 지원 (subset). 1차 분류기 스키마는 단순해서 OK.
- * 5) **캐싱**: Gemini는 별도 API (ai.caches). 1차 미적용 — Anthropic의 inline cache_control 같은 게 없음.
- *    → 같은 시스템 프롬프트로 여러 번 호출해도 캐시 안 됨. 비용 약간 더 들 수 있음 (5-10%).
+ * 5) **캐싱**: Gemini는 별도 API (ai.caches). 1차 미적용.
  * 6) **Thinking 모델 함정** ← M3a-2 검증에서 발견
- *    - gemini-3.x-pro-preview: thinking 강제. thinkingBudget=0이 INVALID_ARGUMENT 에러.
- *    - gemini-2.5-pro / gemini-3-flash: thinking 끌 수 있음. 0으로 설정.
- *    분류 작업은 reasoning 불필요하므로, thinking 끌 수 있는 모델을 기본으로 사용.
- *    Pro reasoning이 필요하면 model 파라미터로 명시적으로 gemini-3.1-pro-preview 지정.
+ *    공식 문서 (https://ai.google.dev/gemini-api/docs/thinking) 기준:
+ *    - thinking 끄기 가능: gemini-2.5-flash, gemini-2.5-flash-lite
+ *    - thinking 끄기 불가: gemini-2.5-pro, gemini-3.x 전체
+ *    분류 작업은 reasoning이 그렇게 강하게 필요하지 않으므로,
+ *    thinking 끌 수 있는 가벼운 모델(gemini-2.5-flash)을 기본값으로 둠.
+ *    Pro reasoning이 필요해지면 호출 시 model 명시 + maxTokens 충분히 잡기.
  * 7) **에러 형식**: Gemini SDK는 ApiError 또는 ClientError 등으로 throw. status 필드 있음.
  */
 
@@ -47,10 +48,10 @@ import { calculateCost } from "../cost";
 // 클라이언트
 // ─────────────────────────────────────────────────────────────
 
-// gemini-2.5-pro: thinking 끌 수 있음. 분류 작업 기본값으로 적합.
-// 가격: 입력 $1.25/1M, 출력 $10/1M.
-// Pro reasoning이 필요해지면 호출 시 model 파라미터로 gemini-3.1-pro-preview 지정.
-const DEFAULT_MODEL = "gemini-2.5-pro";
+// gemini-2.5-flash: thinking 끌 수 있고 가격이 저렴 ($0.30/$2.50).
+// 분류 작업은 reasoning이 강하게 필요하지 않아 Flash로 충분.
+// 부족하면 호출 시 model 파라미터로 gemini-2.5-pro 또는 gemini-3.1-pro-preview 명시.
+const DEFAULT_MODEL = "gemini-2.5-flash";
 
 let _client: GoogleGenAI | null = null;
 
@@ -77,21 +78,22 @@ function getClient(): GoogleGenAI {
 }
 
 // ─────────────────────────────────────────────────────────────
-// thinking 끌 수 있는 모델 판별
+// thinking 끌 수 있는 모델 화이트리스트
 // ─────────────────────────────────────────────────────────────
 
 /**
  * 이 모델이 thinkingBudget=0 을 받아주는지.
  *
- * 받아주는 것: gemini-2.5-pro, gemini-2.5-flash, gemini-3-flash 등
- * 안 받아주는 것: gemini-3.x-pro-preview (thinking 강제 — Budget 0 = INVALID_ARGUMENT)
+ * Google 공식 문서 (https://ai.google.dev/gemini-api/docs/thinking) 기준:
+ *   - 끌 수 있음: gemini-2.5-flash, gemini-2.5-flash-lite
+ *   - 끌 수 없음 (Budget 0 → INVALID_ARGUMENT): gemini-2.5-pro, 모든 gemini-3.x
  *
- * 새 모델 등장 시 여기에 추가.
+ * 화이트리스트 패턴 — prefix 매칭으로 미래 변종 (gemini-2.5-flash-002 등) 흡수.
  */
 function supportsDisablingThinking(model: string): boolean {
-  // gemini-3.0-pro-preview, gemini-3.1-pro-preview 등 강제 thinking 모델 제외
-  if (/^gemini-3\.\d+-pro/.test(model)) return false;
-  return true;
+  if (model.startsWith("gemini-2.5-flash-lite")) return true;
+  if (model.startsWith("gemini-2.5-flash")) return true;
+  return false;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -177,7 +179,7 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
 
       if (!matchedCall || !matchedCall.args) {
         const reason = finishReason === "MAX_TOKENS"
-          ? "응답이 maxTokens 한도에서 끊김 (thinking 모델이라 thinking 토큰이 예산을 다 먹은 가능성)"
+          ? "응답이 maxTokens 한도에서 끊김 (thinking 강제 모델이라면 maxTokens를 더 크게 잡아야 함)"
           : `tool 호출 없음, 자유 텍스트 응답: ${textPreview}`;
         throw new LlmCallError(
           "TOOL_NOT_CALLED",
