@@ -122,28 +122,15 @@ export const TOOL_SCHEMA = {
           },
         },
       },
-      intentionalOmissions: {
-        type: "array",
-        description:
-          "본문에서 의도적으로 제외한 블록 + 사유. 침묵 누락은 검증 실패 — 누락 의도가 있으면 반드시 여기에 명시.",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["blockIds", "reason"],
-          properties: {
-            blockIds: {
-              type: "array",
-              minItems: 1,
-              items: { type: "string" },
-            },
-            reason: {
-              type: "string",
-              description:
-                "왜 이 블록을 본문에서 뺐는지 짧은 사유 (예: '부록이라 본문 외 처리').",
-            },
-          },
-        },
-      },
+      // intentionalOmissions 필드는 1차 검증 단계에서 schema 에서 제거됨 (M3b-3 P9).
+      // 이전: LLM 이 본문 외 처리할 블록을 명시할 수 있었음.
+      // 문제: Gemini 가 모든 블록을 intentionalOmissions 로 밀어넣고 페이지 슬롯은 빈 객체로
+      //       출력하는 잘못된 패턴 발생 (P5~P8 모든 시도에서 일관됨).
+      // 처치: LLM 의 "도망갈 곳" 자체를 제거. 모든 manuscript 블록은 페이지 slotBlockRefs 에
+      //       박혀야 하며 (separator 블록은 검증 단계에서 자동 제외 처리),
+      //       이 필드를 schema 에서 빼서 LLM 이 사용할 수 없게 함.
+      // 부활 조건: 다중 슬롯 어휘 본격 도입 시 + retry-with-feedback 으로 LLM 잘못 사용
+      //         교정 가능해진 후. 진짜 본문 외 콘텐츠 처리는 아직 1차에서 미박.
     },
   },
 } as const;
