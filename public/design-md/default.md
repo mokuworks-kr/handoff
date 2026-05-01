@@ -36,16 +36,15 @@ license: MIT
 
 ```yaml
 - [12]            # 풀폭 — 본문, 표지, 장 시작
-# 다중 슬롯 어휘는 1차 검증 단계에서 일단 미박. LLM 의 instruction following 한계 확인 후
-# (Gemini Function Calling Schema 가 minProperties / additionalProperties 강제력 약함) M2 본격
-# 디자인 작업 시 단일 슬롯 검증 통과 확인 후 단계적으로 추가 예정.
-# - [6, 6]          # 반반 — 좌우 동등 비교, 이미지+텍스트
+- [6, 6]          # 반반 — 좌우 동등 비교, 이미지+텍스트
+# M3b-5 1단계 (2026-05): [6,6] 부활. halves-text-text + halves-text-image 활성화.
+# 사용자 lab 검증으로 통과 확인 후 다음 단계로 [8,4]/[4,4,4]/[3,3,3,3] 점진 부활.
 # - [8, 4]          # 비대칭 — 본문 + 사이드, 표 + 캡션
 # - [4, 4, 4]       # 3분할 — 비전/미션/가치, 사업 영역 3개
 # - [3, 3, 3, 3]    # 4분할 — 분기별 실적, 임원 4명, 4단계 프로세스
 ```
 
-1차 — 풀폭만. LLM 단일 슬롯 결정 부담 최소화 (M3b-3 검증 단계 결정).
+M3b-5 1단계: 풀폭 + 반반. LLM 의 콤포지션 선택 + 슬롯별 블록 분배 정확도 검증 단계.
 어휘에 등장하는 비율과 매칭되는 콤포지션은
 `lib/layout/patterns/index.ts` 의 `getPatternsForVocabulary()` 가 자동 매칭.
 부족하면 같은 톤 안에서 변종(default-rich 등)을 만들어 비율 추가.
