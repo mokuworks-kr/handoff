@@ -212,6 +212,9 @@ export type ValidationResult = {
  * idempotencyKey: 재시도 안전성. 같은 키로 두 번 호출되면 LLM 캐시 활용 또는 중복 차단.
  *   현재 1차 정책: 호출 시점에 사용 안 함, M3b-2-e 라우트에서 크레딧 차감 멱등성에만 사용.
  *   여기서는 향후 LLM 응답 캐싱 자리만 마련.
+ *
+ * callTool: 테스트용 dependency injection. production 에서는 주입 안 함 — 기본 callTool 사용.
+ *   테스트에서 LLM 응답을 모킹하려고 함수를 직접 주입 (ESM read-only export 우회).
  */
 export type PaginateInput = {
   manuscript: ClassifiedManuscript;
@@ -221,6 +224,13 @@ export type PaginateInput = {
   artifactType: "bound" | "folded";
   callerLabel?: string;
   idempotencyKey?: string;
+  /**
+   * LLM 호출 함수 override. 테스트에서만 주입.
+   * 기본값: lib/llm/call-tool 의 callTool.
+   */
+  callTool?: (input: import("@/lib/llm/call-tool").CallToolInput) => Promise<
+    import("@/lib/llm/call-tool").CallToolOutput
+  >;
 };
 
 /**
