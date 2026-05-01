@@ -71,3 +71,13 @@ export function creditsToUsdApprox(credits: number): number {
  * M3 검증 단계 임시값 10. 페이지네이션·편집 비용 측정 후 조정.
  */
 export const MIN_CREDIT_BALANCE_FOR_CLASSIFY = 10;
+
+/**
+ * 페이지네이션 호출 전 잔액 체크용 최소 임계값.
+ *
+ * 페이지네이션 1회 ~$0.20 추정 (gemini-2.5-pro thinking, 30~40페이지 책 기준).
+ * USD_PER_CREDIT = 0.01 → ~20 크레딧 실비. 임계는 안전 마진 + 재시도 여유 두고 30.
+ *
+ * 정식 가격 정책 결정 시 (M4) 이 상수 갱신.
+ */
+export const MIN_CREDIT_BALANCE_FOR_PAGINATE = 30;
