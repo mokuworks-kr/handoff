@@ -6,7 +6,7 @@
  * 책임:
  *   1) Gemini API 호출 (ai.models.generateContent)
  *   2) FunctionCallingConfigMode.ANY 로 tool 호출 강제
- *   3) thinking 비활성화 (분류 작업은 reasoning 불필요, MAX_TOKENS 함정 회피)
+ *   3) thinking 모델 처리 (모델별 조건부 — 일부 모델은 thinking 강제)
  *   4) 재시도 (3회 exp backoff)
  *   5) 에러를 LlmCallError로 통일
  *   6) 토큰/비용 추적
@@ -22,10 +22,10 @@
  * 5) **캐싱**: Gemini는 별도 API (ai.caches). 1차 미적용 — Anthropic의 inline cache_control 같은 게 없음.
  *    → 같은 시스템 프롬프트로 여러 번 호출해도 캐시 안 됨. 비용 약간 더 들 수 있음 (5-10%).
  * 6) **Thinking 모델 함정** ← M3a-2 검증에서 발견
- *    Gemini 3.x Pro는 reasoning 모델이라 응답 전 internal thinking 토큰을 사용.
- *    maxOutputTokens가 thinking + 출력 합산이라, thinking이 예산 다 먹으면 functionCall이
- *    못 나오고 stopReason="MAX_TOKENS"로 끝남. 분류 작업은 reasoning 불필요하므로
- *    thinkingConfig.thinkingBudget = 0 으로 끄는 게 맞음. (속도 ↑, 비용 ↓, 정확도 영향 미미)
+ *    - gemini-3.x-pro-preview: thinking 강제. thinkingBudget=0이 INVALID_ARGUMENT 에러.
+ *    - gemini-2.5-pro / gemini-3-flash: thinking 끌 수 있음. 0으로 설정.
+ *    분류 작업은 reasoning 불필요하므로, thinking 끌 수 있는 모델을 기본으로 사용.
+ *    Pro reasoning이 필요하면 model 파라미터로 명시적으로 gemini-3.1-pro-preview 지정.
  * 7) **에러 형식**: Gemini SDK는 ApiError 또는 ClientError 등으로 throw. status 필드 있음.
  */
 
@@ -47,7 +47,10 @@ import { calculateCost } from "../cost";
 // 클라이언트
 // ─────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = "gemini-3.1-pro-preview";
+// gemini-2.5-pro: thinking 끌 수 있음. 분류 작업 기본값으로 적합.
+// 가격: 입력 $1.25/1M, 출력 $10/1M.
+// Pro reasoning이 필요해지면 호출 시 model 파라미터로 gemini-3.1-pro-preview 지정.
+const DEFAULT_MODEL = "gemini-2.5-pro";
 
 let _client: GoogleGenAI | null = null;
 
@@ -74,6 +77,24 @@ function getClient(): GoogleGenAI {
 }
 
 // ─────────────────────────────────────────────────────────────
+// thinking 끌 수 있는 모델 판별
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 이 모델이 thinkingBudget=0 을 받아주는지.
+ *
+ * 받아주는 것: gemini-2.5-pro, gemini-2.5-flash, gemini-3-flash 등
+ * 안 받아주는 것: gemini-3.x-pro-preview (thinking 강제 — Budget 0 = INVALID_ARGUMENT)
+ *
+ * 새 모델 등장 시 여기에 추가.
+ */
+function supportsDisablingThinking(model: string): boolean {
+  // gemini-3.0-pro-preview, gemini-3.1-pro-preview 등 강제 thinking 모델 제외
+  if (/^gemini-3\.\d+-pro/.test(model)) return false;
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────
 // 메인 함수
 // ─────────────────────────────────────────────────────────────
 
@@ -97,11 +118,16 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
     parameters: input.tool.input_schema as Schema,
   };
 
+  // thinking 끌 수 있는 모델만 0으로. 못 끄는 모델은 thinkingConfig 자체를 빼서 SDK 기본값 따름.
+  const thinkingConfig = supportsDisablingThinking(model)
+    ? { thinkingBudget: 0 }
+    : undefined;
+
   let lastError: unknown = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       console.log(
-        `[${label}] gemini call attempt=${attempt + 1}/${maxRetries + 1} model=${model} maxTokens=${input.maxTokens}`,
+        `[${label}] gemini call attempt=${attempt + 1}/${maxRetries + 1} model=${model} maxTokens=${input.maxTokens} thinkingDisabled=${thinkingConfig !== undefined}`,
       );
 
       const response: GenerateContentResponse = await client.models.generateContent({
@@ -110,10 +136,7 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
         config: {
           systemInstruction: input.system,
           maxOutputTokens: input.maxTokens,
-          // Thinking 비활성화 — 분류 작업은 reasoning 불필요.
-          // 켜져 있으면 thinking 토큰이 maxOutputTokens를 다 먹어서
-          // functionCall이 안 나오고 MAX_TOKENS로 끝남.
-          thinkingConfig: { thinkingBudget: 0 },
+          ...(thinkingConfig ? { thinkingConfig } : {}),
           tools: [{ functionDeclarations: [functionDeclaration] }],
           toolConfig: {
             functionCallingConfig: {
@@ -154,7 +177,7 @@ export async function callToolGemini<TInput extends Record<string, unknown>>(
 
       if (!matchedCall || !matchedCall.args) {
         const reason = finishReason === "MAX_TOKENS"
-          ? "응답이 maxTokens 한도에서 끊김 (thinking 모델일 가능성 — thinkingBudget=0 확인)"
+          ? "응답이 maxTokens 한도에서 끊김 (thinking 모델이라 thinking 토큰이 예산을 다 먹은 가능성)"
           : `tool 호출 없음, 자유 텍스트 응답: ${textPreview}`;
         throw new LlmCallError(
           "TOOL_NOT_CALLED",
