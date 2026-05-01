@@ -54,9 +54,36 @@
  *    "Minimal Mono × 빠른 호흡" 같은 자유 조합 미지원.
  *    변종이 필요하면 새 디자인 스타일로 추가 (예: "Minimal Mono Fast").
  *    이유: 시각 스타일과 호흡은 디자이너가 같이 만지는 한 세트라서.
+ *
+ * ─────────────────────────────────────────────────────────────
+ * M3a-3 추가: author + license + version (커뮤니티 확장 대비)
+ * ─────────────────────────────────────────────────────────────
+ *
+ * 디자인 카탈로그가 미래에 커뮤니티로 확장될 때 필요한 메타데이터를
+ * 1차 출시 시점에 미리 박아둔다. 1차에서는 builtin 카탈로그가 모두
+ * author: { id: "handoff-builtin" } 로 채워지지만, 미래 사용자/디자이너가
+ * 자기 디자인을 올릴 때 같은 필드를 그대로 사용한다.
+ *
+ * 이 필드는 §A "확장 축"의 5번째 축(공유 어댑터)을 위한 사전 작업이다.
+ * 지금 박아두면 미래 데이터 마이그레이션 비용 0.
  */
 
 import type { Color, Font, ParagraphStyle, CharacterStyle } from "./styles";
+
+/**
+ * 디자인 작자 정보.
+ *
+ * 1차 builtin 카탈로그: { id: "handoff-builtin", name: "Handoff" }
+ * 미래 커뮤니티 업로드: 사용자 ID + 표시 이름 + 선택적 URL
+ */
+export type DesignAuthor = {
+  /** 작자 식별자. builtin은 "handoff-builtin", 커뮤니티는 user UUID 등 */
+  id: string;
+  /** 사람이 읽는 이름 */
+  name: string;
+  /** 작자 프로필/포트폴리오 URL (선택) */
+  url?: string;
+};
 
 export type DesignTokens = {
   /** design.md 슬러그 (예: "minimal-mono", "warm-editorial") */
@@ -65,6 +92,36 @@ export type DesignTokens = {
   name: string;
   /** 한 줄 설명 */
   description?: string;
+
+  /**
+   * 디자인 버전 — semver 권장 ("1.0.0").
+   * 카탈로그 변경 시 +1. 사용자 문서는 origin.designVersion 으로 어느 버전을
+   * 시작점으로 했는지 기억.
+   *
+   * 1차 출시 시점에는 모든 builtin 디자인이 "1.0.0" 으로 시작.
+   */
+  version?: string;
+
+  /**
+   * 작자. 1차 builtin은 { id: "handoff-builtin", name: "Handoff" }.
+   * 커뮤니티 업로드 시 사용자가 채움.
+   */
+  author?: DesignAuthor;
+
+  /**
+   * 라이선스. 미지정 시 builtin 정책 (Handoff 기본 라이선스) 적용.
+   * 커뮤니티 업로드 시 작자가 명시.
+   *
+   * 권장 값:
+   *   "MIT"               — 자유 사용, 거의 제약 없음
+   *   "CC-BY-4.0"         — 저작자 표시 후 자유 사용
+   *   "CC-BY-NC-4.0"      — 저작자 표시 + 비상업적 사용만
+   *   "CC-BY-SA-4.0"      — 표시 + 동일 라이선스로 재배포
+   *   "All Rights Reserved" — 작자 명시적 허락 필요
+   *
+   * 1차 builtin은 "MIT" 로 시작 (Handoff 자체 라이선스에 종속).
+   */
+  license?: string;
 
   /**
    * 컬러 팔레트 (HEX).
