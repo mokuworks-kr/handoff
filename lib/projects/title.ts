@@ -1,164 +1,93 @@
 /**
- * 크레딧 차감 — Supabase RPC `deduct_credits` 호출 헬퍼.
+ * ClassifiedManuscript → 자동 제목.
  *
- * deduct_credits 함수는 SECURITY DEFINER 로 RLS 우회 + 원자적 차감을 보장
- * (supabase/migrations/0001_init.sql).
+ * `Project.title` 의 초기값을 만든다. 사용자가 수정 가능 (UI에서).
  *
- * 이 헬퍼의 책임:
- *   1) admin client 또는 server client 모두에서 호출 가능 (RPC가 SECURITY DEFINER라 anon도 OK)
- *   2) idempotency_key 강제 — 호출자가 반드시 명시
- *   3) 에러 케이스 분리:
- *       - INSUFFICIENT_CREDITS: 사용자에게 보여줄 수 있는 에러
- *       - PROFILE_NOT_FOUND: 시스템 에러 (트리거 누락 등)
- *       - 네트워크 등: 재시도 권장
- *   4) USD → 크레딧 환산은 호출자 쪽에서 수행 후 정수만 넘김 (이 함수는 USD 모름)
+ * 주의: 이 함수는 *대시보드 구분용 제목*만 만든다. 인쇄물에 박히는 제목은
+ * 페이지네이션 LLM(M3b)이 만드는 표지 페이지의 텍스트 프레임에 들어가고,
+ * 그 텍스트는 분류기가 잡은 cover-like 섹션의 *원본 텍스트를 그대로* 사용한다
+ * (§1 약속 — 원고 안 다듬음).
  *
- * 호출 예:
+ * 추출 우선순위:
+ *   1) cover-like 섹션의 첫 heading 텍스트
+ *   2) cover-like 섹션의 첫 paragraph 텍스트
+ *   3) 첫 번째 heading (kind 무관)
+ *   4) 첫 번째 paragraph (kind 무관)
+ *   5) source.filename (확장자 제거)
+ *   6) "제목 없음"
  *
- *   const cost = classifyResult.classification.rawCostUsd;
- *   const credits = usdToCredits(cost);
- *
- *   await deductCredits({
- *     supabase,
- *     userId: user.id,
- *     credits,
- *     projectId: newProject.id,
- *     inputTokens: classifyResult.classification.inputTokens,
- *     outputTokens: classifyResult.classification.outputTokens,
- *     cacheReadTokens: classifyResult.classification.cacheReadTokens ?? 0,
- *     model: classifyResult.classification.model,
- *     rawCostUsd: cost,
- *     idempotencyKey: `classify:${newProject.id}`,
- *   });
+ * 추출된 텍스트는 30자로 잘라 ".." 추가.
  */
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { ClassifiedManuscript } from "@/lib/classify/types";
+import type { Block } from "@/lib/parsers/normalized";
 
-export type DeductCreditsInput = {
-  supabase: SupabaseClient;
-  userId: string;
-  /** 차감할 크레딧 (양수, 0 허용) */
-  credits: number;
-  /** 관련 프로젝트 ID — 거래 원장 추적용 */
-  projectId: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  model: string;
-  rawCostUsd: number;
-  /**
-   * 멱등키 — 같은 값으로 두 번 호출되면 두 번째는 no-op.
-   * 분류기 호출 1회 = 1 idempotency_key.
-   * 권장 형식: "{operation}:{projectId}" 또는 "{operation}:{userId}:{timestamp}"
-   */
-  idempotencyKey: string;
-};
+const MAX_TITLE_LENGTH = 30;
 
-export class DeductCreditsError extends Error {
-  readonly code:
-    | "INSUFFICIENT_CREDITS"
-    | "PROFILE_NOT_FOUND"
-    | "INVALID_INPUT"
-    | "RPC_FAILED"
-    | "UNKNOWN";
-  readonly cause?: unknown;
-
-  constructor(
-    code: DeductCreditsError["code"],
-    message: string,
-    cause?: unknown,
-  ) {
-    super(message);
-    this.name = "DeductCreditsError";
-    this.code = code;
-    this.cause = cause;
+export function extractProjectTitle(manuscript: ClassifiedManuscript): string {
+  // 1) cover-like 섹션 안에서 찾기
+  const coverSection = manuscript.sections.find((s) => s.kind === "cover-like");
+  if (coverSection) {
+    const blocks = blocksInRange(
+      manuscript.blocks,
+      coverSection.fromBlockId,
+      coverSection.toBlockId,
+    );
+    const fromCover = pickFirstTextFrom(blocks);
+    if (fromCover) return truncate(fromCover);
   }
+
+  // 2~4) 전체 블록에서 첫 heading 또는 paragraph
+  const fromAny = pickFirstTextFrom(manuscript.blocks);
+  if (fromAny) return truncate(fromAny);
+
+  // 5) 파일명
+  const filename = manuscript.source.filename;
+  if (filename && filename !== "untitled.txt") {
+    const stripped = filename.replace(/\.[^.]+$/, "").trim();
+    if (stripped.length > 0) return truncate(stripped);
+  }
+
+  // 6) fallback
+  return "제목 없음";
 }
 
 /**
- * 크레딧 차감.
- *
- * 0 크레딧 차감은 RPC 호출 안 하고 바로 리턴 (no-op). 매우 작은 호출도
- * usdToCredits 가 최소 1 보장하지만, 정책 변경으로 0이 들어올 수 있어 가드.
+ * 블록 배열에서 첫 의미 있는 텍스트 1개 추출.
+ * heading > paragraph 우선. 둘 다 없으면 null.
  */
-export async function deductCredits(input: DeductCreditsInput): Promise<void> {
-  if (typeof window !== "undefined") {
-    throw new DeductCreditsError(
-      "RPC_FAILED",
-      "deductCredits() 는 서버에서만 호출 가능합니다.",
-    );
+function pickFirstTextFrom(blocks: Block[]): string | null {
+  // 우선 heading
+  for (const b of blocks) {
+    if (b.type === "heading") {
+      const text = b.runs.map((r) => r.text).join("").trim();
+      if (text.length > 0) return text;
+    }
   }
-
-  if (input.credits < 0 || !Number.isInteger(input.credits)) {
-    throw new DeductCreditsError(
-      "INVALID_INPUT",
-      `credits는 0 이상의 정수여야 합니다 (got ${input.credits})`,
-    );
+  // 다음 paragraph
+  for (const b of blocks) {
+    if (b.type === "paragraph") {
+      const text = b.runs.map((r) => r.text).join("").trim();
+      if (text.length > 0) return text;
+    }
   }
-
-  if (input.credits === 0) return;
-
-  if (!input.idempotencyKey || input.idempotencyKey.length === 0) {
-    throw new DeductCreditsError(
-      "INVALID_INPUT",
-      "idempotencyKey는 필수입니다.",
-    );
-  }
-
-  const { error } = await input.supabase.rpc("deduct_credits", {
-    p_user_id: input.userId,
-    p_credits: input.credits,
-    p_project_id: input.projectId,
-    p_input_tokens: input.inputTokens,
-    p_output_tokens: input.outputTokens,
-    p_cache_read_tokens: input.cacheReadTokens,
-    p_model: input.model,
-    p_raw_cost_usd: input.rawCostUsd,
-    p_idempotency_key: input.idempotencyKey,
-  });
-
-  if (!error) return;
-
-  // PG 함수가 raise exception 한 케이스 매핑
-  const msg = error.message ?? "";
-  if (msg.includes("INSUFFICIENT_CREDITS")) {
-    throw new DeductCreditsError(
-      "INSUFFICIENT_CREDITS",
-      "크레딧이 부족합니다.",
-      error,
-    );
-  }
-  if (msg.includes("PROFILE_NOT_FOUND")) {
-    throw new DeductCreditsError(
-      "PROFILE_NOT_FOUND",
-      "프로필을 찾을 수 없습니다. 가입 트리거가 누락됐을 가능성.",
-      error,
-    );
-  }
-
-  throw new DeductCreditsError(
-    "RPC_FAILED",
-    `deduct_credits RPC 호출 실패: ${msg}`,
-    error,
-  );
+  return null;
 }
 
-/**
- * 잔액 조회 — 차감 호출 전 사전 체크용.
- *
- * RLS에 의해 본인 행만 조회 가능. user 인증된 클라이언트에서 호출.
- * 잔액이 없으면 (profile 행 자체가 없으면) null.
- */
-export async function getCreditBalance(
-  supabase: SupabaseClient,
-  userId: string,
-): Promise<number | null> {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("credit_balance")
-    .eq("id", userId)
-    .single();
+function blocksInRange(
+  blocks: Block[],
+  fromId: string,
+  toId: string,
+): Block[] {
+  const fromIdx = blocks.findIndex((b) => b.id === fromId);
+  const toIdx = blocks.findIndex((b) => b.id === toId);
+  if (fromIdx === -1 || toIdx === -1 || toIdx < fromIdx) return [];
+  return blocks.slice(fromIdx, toIdx + 1);
+}
 
-  if (error) return null;
-  return data?.credit_balance ?? null;
+function truncate(text: string): string {
+  // 줄바꿈 → 공백 정규화
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= MAX_TITLE_LENGTH) return normalized;
+  return normalized.slice(0, MAX_TITLE_LENGTH) + "…";
 }
