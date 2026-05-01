@@ -209,11 +209,12 @@ export type ValidationResult = {
  *
  * callerLabel: LLM 호출 디버깅·로그 식별자. 예: "paginate-{projectId}".
  *
- * idempotencyKey: 재시도 안전성. 같은 키로 두 번 호출되면 LLM 캐시 활용 또는 중복 차단.
- *   현재 1차 정책: 호출 시점에 사용 안 함, M3b-2-e 라우트에서 크레딧 차감 멱등성에만 사용.
- *   여기서는 향후 LLM 응답 캐싱 자리만 마련.
+ * idempotencyKey: 라우트의 크레딧 차감 멱등성용. lib/llm 자체는 멱등키 미지원.
  *
- * callTool: 테스트용 dependency injection. production 에서는 주입 안 함 — 기본 callTool 사용.
+ * provider: 옵셔널 — 미지정 시 환경변수 LLM_PROVIDER (lib/llm 기본).
+ *   1차 검증 단계에서 force gemini 등이 필요하면 명시적으로 줌.
+ *
+ * callTool: 테스트용 dependency injection. production 에서는 주입 안 함 — lib/llm 의 callTool 사용.
  *   테스트에서 LLM 응답을 모킹하려고 함수를 직접 주입 (ESM read-only export 우회).
  */
 export type PaginateInput = {
@@ -222,15 +223,17 @@ export type PaginateInput = {
   patterns: readonly CompositionPattern[];
   format: Document["format"];
   artifactType: "bound" | "folded";
+  provider?: import("@/lib/llm").LlmProvider;
   callerLabel?: string;
   idempotencyKey?: string;
   /**
    * LLM 호출 함수 override. 테스트에서만 주입.
-   * 기본값: lib/llm/call-tool 의 callTool.
+   * 기본값: lib/llm 의 callTool.
+   * 시그니처는 lib/llm/types.ts 의 callTool 와 동일.
    */
-  callTool?: (input: import("@/lib/llm/call-tool").CallToolInput) => Promise<
-    import("@/lib/llm/call-tool").CallToolOutput
-  >;
+  callTool?: <TInput extends Record<string, unknown>>(
+    input: import("@/lib/llm").CallToolInput<TInput>,
+  ) => Promise<import("@/lib/llm").CallToolResult<TInput>>;
 };
 
 /**
@@ -325,18 +328,13 @@ export type ResolvedPageBlueprint = {
 };
 
 // ─────────────────────────────────────────────────────────────
-// 크레딧 정책 임시 상수
+// 크레딧 정책
 // ─────────────────────────────────────────────────────────────
 
 /**
  * 페이지네이션 호출 전 잔액 사전 체크용 최소 임계값.
  *
- * 분류기 호출 비용 ~$0.005 → 1 크레딧 인 반면
- * 페이지네이션 호출 비용 ~$0.20 추정 → 20 크레딧.
- *
- * 사전 체크 임계는 실비보다 크게: 30. (안전 마진 + 재시도 여유)
- *
- * 정식 가격 정책 결정 시 (M4) 이 상수 갱신.
- * 현재 임시값 — 검증 단계 동안만 유효.
+ * 단일 출처는 lib/credits/convert.ts. 이 파일에서는 편의를 위해 re-export.
+ * 분류기 패턴(MIN_CREDIT_BALANCE_FOR_CLASSIFY)과 동일.
  */
-export const MIN_CREDIT_BALANCE_FOR_PAGINATE = 30;
+export { MIN_CREDIT_BALANCE_FOR_PAGINATE } from "@/lib/credits/convert";
