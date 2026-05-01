@@ -54,7 +54,7 @@ export const TOOL_SCHEMA = {
             "pattern",
             "role",
             "side",
-            "slotBlockRefs",
+            "sectionIds",
             "splitReason",
           ],
           properties: {
@@ -92,20 +92,11 @@ export const TOOL_SCHEMA = {
                 "콤포지션의 variants 선택값. 예: { asymmetryDirection: 'wide-left' }",
               additionalProperties: { type: "string" },
             },
-            slotBlockRefs: {
-              type: "object",
-              description:
-                "슬롯별 블록 ID 매핑. 텍스트를 직접 쓰지 말고 manuscript.blocks 의 ID 만 참조합니다. 슬롯 종류와 블록 종류가 맞아야 합니다 (text 슬롯에는 heading/paragraph/list, image 슬롯에는 image, table 슬롯에는 table 블록). **빈 객체 {} 또는 모든 슬롯이 빈 배열인 객체는 절대 출력하지 마세요** — 그런 페이지는 의미가 없으므로 페이지 자체를 만들지 않거나 다른 페이지에 콘텐츠를 합쳐야 합니다. 콤포지션이 정의한 모든 필수 슬롯(optional=false)이 채워져 있어야 하며, optional 슬롯을 비우려면 hiddenSlotIds 에 명시.",
-              minProperties: 1,
-              additionalProperties: {
-                type: "array",
-                items: { type: "string" },
-              },
-            },
-            hiddenSlotIds: {
+            sectionIds: {
               type: "array",
               description:
-                "의도적으로 비운 슬롯 ID 목록. 슬롯의 optional=true 인 경우만 허용.",
+                "이 페이지가 담는 manuscript section ID 목록 (manuscript.sections 의 id 참조). 예: ['s001'] 또는 ['s002', 's003']. 한 페이지가 여러 섹션을 담을 수도 (짧은 섹션들 결합), 한 섹션이 여러 페이지로 나뉠 수도 있음 (긴 섹션 분할 — 그 경우 같은 sectionId 가 인접 페이지들에 반복됨). 빈 배열 절대 금지 — 모든 페이지는 최소 1개 섹션을 담아야 함. 코드가 이 sectionIds 로부터 슬롯별 블록 매핑을 자동으로 채우므로 텍스트나 블록 ID 를 직접 박지 마세요.",
+              minItems: 1,
               items: { type: "string" },
             },
             splitReason: {
