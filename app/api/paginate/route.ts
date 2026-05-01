@@ -253,21 +253,44 @@ export async function POST(request: NextRequest) {
     }
 
     // 8) 응답
+    //
+    // M3b-4 (2026-05): 응답을 풀 페이로드로 확장.
+    // 클라이언트가 응답 받자마자 PaginateResultView 즉시 렌더할 수 있게
+    // pages + validation issues + llmRaw + stylesPatch 포함.
+    //
+    // lab 라우트(/api/lab/paginate)와 응답 구조가 거의 같아짐.
+    // 차이는 (a) DB 저장 여부 (saved: true), (b) 크레딧 차감 여부.
+    // 책임 분리는 §6.4 그대로 — paginateBook 은 DB 안 건드림, 호출자가 처리.
     const issuesByseverity = countBySeverity(output.validation.issues);
     return NextResponse.json({
       projectId,
-      pageCount: output.pages.length,
+      // 페이지 카드 그리드 + SVG 미리보기용
+      pages: output.pages,
+      // LLM raw 메타 — rationale, slotBlockRefs, splitReason 등
+      llmRaw: output.llmRaw,
+      // 검증 결과 — 풀 issues 메시지 (사용자에게 디테일 펼침으로 노출)
       validation: {
+        hasError: output.validation.hasError,
+        validPageCount: output.validation.validPageCount,
+        issues: output.validation.issues,
+        // 카운트는 호환성 유지용 (있으면 편함)
         errorCount: issuesByseverity.error,
         warnCount: issuesByseverity.warn,
         infoCount: issuesByseverity.info,
       },
+      // LLM 호출 메타
       llm: {
         model: output.llm.model,
         inputTokens: output.llm.inputTokens,
         outputTokens: output.llm.outputTokens,
+        cacheReadTokens: output.llm.cacheReadTokens,
         rawCostUsd: cost,
+        stopReason: output.llm.stopReason,
       },
+      // 카탈로그 동기화 결과 — 색상 등 표시에 필요
+      stylesPatch: output.stylesPatch,
+      // DB 저장됐다는 표시 (lab 응답의 saved:false 와 대비)
+      saved: true,
     });
   } catch (e) {
     console.error("[paginate] unhandled", e);
