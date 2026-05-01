@@ -51,7 +51,7 @@ import type {
 } from "@/lib/layout/composition";
 import { realize } from "@/lib/layout/grid";
 import { findPatternBySlug } from "@/lib/layout/patterns";
-import { callTool, LlmCallError } from "@/lib/llm/call-tool";
+import { callTool, LlmCallError } from "@/lib/llm";
 import type {
   Block,
   HeadingBlock,
@@ -81,7 +81,8 @@ import {
 
 const MODEL_PAGINATE = "gemini-2.5-pro";
 const MAX_OUTPUT_TOKENS = 32000; // 시드 30~40페이지 기준 충분 (page 당 ~500토큰 ×40 = 20K)
-const THINKING_BUDGET = 8000; // 전체 책 호흡 결정에 충분한 사고 토큰
+// 주: gemini-2.5-pro 는 lib/llm/providers/gemini.ts 의 thinking 강제 화이트리스트 대상.
+// thinking 옵션을 별도로 박을 필요 없음 — 모델명만으로 어댑터가 처리.
 
 export async function paginateBook(input: PaginateInput): Promise<PaginateOutput> {
   // ── 1. 입력 검증 ────────────────────────────────────────────
@@ -91,21 +92,34 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   const userMessage = buildUserMessage(input);
 
   // ── 3. LLM 호출 ─────────────────────────────────────────────
+  //
+  // callTool 진짜 시그니처 (lib/llm/types.ts 참조):
+  //   { provider?, model?, system, messages, tool, maxTokens, forceToolUse?, callerLabel? }
+  //
+  // - provider 미지정 → 환경변수 LLM_PROVIDER (기본 anthropic 또는 gemini)
+  // - model 미지정 → 어댑터의 기본 모델
+  //   페이지네이션은 reasoning 무거운 작업이라 명시적으로 gemini-2.5-pro 박음.
+  //   gemini-2.5-pro / 3.x-pro-preview 는 thinking 강제 화이트리스트라 별도 옵션 불필요.
+  // - forceToolUse: true (분류기와 동일, 자유 텍스트 응답 안 받음)
+  // - idempotencyKey: lib/llm 미지원. 라우트의 크레딧 차감 멱등성에서만 사용.
   const callToolFn = input.callTool ?? callTool;
   let toolOutput;
   try {
-    toolOutput = await callToolFn({
-      provider: "gemini",
+    toolOutput = await callToolFn<LlmBookOutput>({
+      provider: input.provider,
       model: MODEL_PAGINATE,
-      systemPrompt: PAGINATE_SYSTEM_PROMPT,
-      userMessage,
-      toolSchema: TOOL_SCHEMA,
+      system: PAGINATE_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: userMessage }],
+      tool: {
+        name: TOOL_SCHEMA.name,
+        description: TOOL_SCHEMA.description,
+        input_schema: TOOL_SCHEMA.parameters,
+      },
+      maxTokens: MAX_OUTPUT_TOKENS,
+      forceToolUse: true,
       callerLabel: input.callerLabel ?? "paginate-book",
-      idempotencyKey: input.idempotencyKey,
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
-      thinking: { enabled: true, budgetTokens: THINKING_BUDGET },
     });
-  } catch (e) {
+  } catch (e: unknown) {
     if (e instanceof LlmCallError) {
       throw new PaginateError("LLM_FAILED", `LLM 호출 실패: ${e.message}`, {
         cause: e,
@@ -117,7 +131,7 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
   }
 
   // ── 4. LLM 출력 파싱 ─────────────────────────────────────────
-  const llmBook = parseLlmOutput(toolOutput.toolInput);
+  const llmBook = parseLlmOutput(toolOutput.output);
 
   // ── 5. 검증 ──────────────────────────────────────────────────
   const validation = validateLlmOutput({
@@ -150,9 +164,9 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
     stylesPatch,
     llm: {
       model: toolOutput.model,
-      inputTokens: toolOutput.inputTokens,
-      outputTokens: toolOutput.outputTokens,
-      cacheReadTokens: toolOutput.cacheReadTokens,
+      inputTokens: toolOutput.usage.inputTokens,
+      outputTokens: toolOutput.usage.outputTokens,
+      cacheReadTokens: toolOutput.usage.cacheReadTokens,
       rawCostUsd: toolOutput.rawCostUsd,
       stopReason: toolOutput.stopReason,
     },
