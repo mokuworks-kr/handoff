@@ -274,11 +274,14 @@ function validateInput(input: PaginateInput): void {
  *   1) 각 페이지의 sectionIds 의 각 섹션에서 블록들을 순서대로 모음 (blocksInSection)
  *   2) separator 블록 자동 제외
  *   3) 콤포지션 슬롯 종류 보고 분배:
- *      - 단일 슬롯 콤포지션 (full-text, full-image, full-image-bleed):
- *        모든 텍스트 블록 → text 슬롯 / 첫 image 블록 → image 슬롯 / 첫 table → table
- *        호환 안 되는 블록은 그냥 제외 (예: full-text 인데 manuscript 에 image 있는 경우 image 무시)
- *      - 다중 슬롯 콤포지션: 1차에선 미박. P10 단계에선 단일 슬롯만 활성 어휘.
- *        다중 슬롯 어휘 부활 시 (M2 본격) 별도 분배 로직 박아야 함.
+ *      - **단일 슬롯** (full-text, full-image): 슬롯 종류에 맞는 모든 블록 + (text 슬롯이면)
+ *        호환 안 되는 블록도 모두 수용 (1차 정책 — 누락 회피).
+ *      - **다중 슬롯** (halves-text-text, halves-text-image — M3b-5 1단계 부활):
+ *        블록을 종류별로 분류한 뒤 슬롯 종류별 슬롯에 분배.
+ *        text 블록은 text 슬롯에 *순서대로 균등 분할* (블록 개수 기준).
+ *        image/table 블록은 1개씩 슬롯에 박음 (image/table 슬롯은 1개 블록 규칙).
+ *        호환 안 되는 블록(예: text-text 콤포지션인데 image 블록 있음)은
+ *        첫 text 슬롯에 박음 — 누락 회피 (M3b-3 P11 정책 유지, 다중 슬롯에도 적용).
  *
  * 부작용 (mutates):
  *   - 입력 page 객체의 slotBlockRefs / hiddenSlotIds 를 박음.
@@ -286,7 +289,7 @@ function validateInput(input: PaginateInput): void {
  *
  * 에러:
  *   - sectionIds 안에 manuscript.sections 에 없는 ID 있으면 throw (검증에서 잡혀야 할 조기 차단).
- *   - 다중 슬롯 콤포지션 만나면 throw (1차에선 단일 슬롯만 — 어휘 정책 §5.7).
+ *   - 슬롯 종류가 모르는 종류(chart/shape — 1차 미지원) 면 빈 슬롯으로 두고 검증에서 잡힘.
  */
 function expandSectionIdsToSlots(
   book: LlmBookOutput,
@@ -319,45 +322,146 @@ function expandSectionIdsToSlots(
       }
     }
 
-    // 콤포지션 슬롯 종류 보고 매핑
-    // 1차 정책: 단일 슬롯 콤포지션만 활성 (full-text, full-image, full-image-bleed)
-    if (pattern.slots.length !== 1) {
-      throw new PaginateError(
-        "REALIZE_FAILED",
-        `pageNumber=${page.pageNumber}: 콤포지션 '${page.pattern}' 의 슬롯 ${pattern.slots.length}개 — 1차에선 단일 슬롯만 지원 (default.md gridVocabulary 정책 §5.7). 다중 슬롯 어휘 부활은 M2 본격 작업 + sectionIds 분배 로직 박은 후.`,
-      );
-    }
-
-    const slot = pattern.slots[0];
-    const slotKind = slot.kind;
-    const matchingBlocks: string[] = [];
-
-    if (slotKind === "text") {
-      // 1차 검증 단계 정책 (M3b-3 P11): text 슬롯에 모든 비-separator 블록을 박음.
-      // heading/paragraph/list 만 박으면 같은 섹션의 table/image 가 BLOCK_ORPHANED 로 누락됨
-      // (P10 결과). 1차는 lab end-to-end 흐름 통과가 본질이므로 시각적 정확성보다
-      // 누락 없는 통과 우선. M2 본격 디자인 작업 시 다시 엄격하게.
-      for (const b of collectedBlocks) {
-        matchingBlocks.push(b.id);
-      }
-    } else if (slotKind === "image") {
-      // image 슬롯 — 첫 image 블록만 (image 슬롯은 1개 블록 정책)
-      const firstImage = collectedBlocks.find((b) => b.type === "image");
-      if (firstImage) matchingBlocks.push(firstImage.id);
-    } else if (slotKind === "table") {
-      // table 슬롯 — 첫 table 블록만
-      const firstTable = collectedBlocks.find((b) => b.type === "table");
-      if (firstTable) matchingBlocks.push(firstTable.id);
-    }
-    // chart / shape: 1차 미지원 (validate.ts isBlockKindCompatible 와 일관)
-
-    page.slotBlockRefs = { [slot.id]: matchingBlocks };
-    // 슬롯이 optional 인데 매핑 블록 0개면 hiddenSlotIds 로 처리
-    if (matchingBlocks.length === 0 && slot.optional) {
-      page.hiddenSlotIds = [slot.id];
-      page.slotBlockRefs = {};
+    // 슬롯 분배 — 단일 vs 다중 분기 (M3b-5 1단계: 다중 부활)
+    const { slotBlockRefs, hiddenSlotIds } = distributeBlocksToSlots(
+      pattern,
+      collectedBlocks,
+    );
+    page.slotBlockRefs = slotBlockRefs;
+    if (hiddenSlotIds.length > 0) {
+      page.hiddenSlotIds = hiddenSlotIds;
     }
   }
+}
+
+/**
+ * 콤포지션의 슬롯들에 블록들을 분배.
+ *
+ * @returns { slotBlockRefs, hiddenSlotIds }
+ *   - slotBlockRefs: { [slotId]: blockId[] } — 빈 매핑 슬롯은 포함 안 함 (optional 슬롯이면 hidden)
+ *   - hiddenSlotIds: optional 인데 매핑 블록 0개인 슬롯 ID 목록
+ */
+function distributeBlocksToSlots(
+  pattern: CompositionPattern,
+  collectedBlocks: Block[],
+): { slotBlockRefs: Record<string, string[]>; hiddenSlotIds: string[] } {
+  const slotBlockRefs: Record<string, string[]> = {};
+  const hiddenSlotIds: string[] = [];
+
+  // 슬롯 종류별 분류 — 정의된 순서 보존 (배치 위치 순서)
+  const textSlots = pattern.slots.filter((s) => s.kind === "text");
+  const imageSlots = pattern.slots.filter((s) => s.kind === "image");
+  const tableSlots = pattern.slots.filter((s) => s.kind === "table");
+
+  // 블록 종류별 분류 — 수집 순서 보존
+  const textBlocks: Block[] = [];
+  const imageBlocks: Block[] = [];
+  const tableBlocks: Block[] = [];
+  const otherBlocks: Block[] = []; // chart/shape 등 1차 미지원 종류
+
+  for (const b of collectedBlocks) {
+    if (b.type === "heading" || b.type === "paragraph" || b.type === "list") {
+      textBlocks.push(b);
+    } else if (b.type === "image") {
+      imageBlocks.push(b);
+    } else if (b.type === "table") {
+      tableBlocks.push(b);
+    } else {
+      otherBlocks.push(b);
+    }
+  }
+
+  // 1) text 블록 → text 슬롯 균등 분할
+  // 블록 개수 기준으로 순서대로 자름. 슬롯 1개면 다, 2개면 절반씩, n개면 1/n 씩.
+  // 잔여 블록(나누어 떨어지지 않을 때)은 마지막 슬롯에 몰아넣음.
+  // 균등 분할 후 호환 안 되는 블록(image/table 슬롯 부족)은 첫 text 슬롯에 추가로 박음 — 누락 회피.
+  const textChunks = chunkEvenly(textBlocks, textSlots.length);
+  textSlots.forEach((slot, idx) => {
+    slotBlockRefs[slot.id] = textChunks[idx]?.map((b) => b.id) ?? [];
+  });
+
+  // 2) image 블록 → image 슬롯 1:1 (image 슬롯은 1개 블록 규칙)
+  // image 슬롯 < image 블록 수: 남는 이미지는 첫 text 슬롯에 박음 (누락 회피, 1차 정책)
+  const imageOverflow: Block[] = [];
+  imageSlots.forEach((slot, idx) => {
+    const block = imageBlocks[idx];
+    slotBlockRefs[slot.id] = block ? [block.id] : [];
+  });
+  for (let i = imageSlots.length; i < imageBlocks.length; i++) {
+    imageOverflow.push(imageBlocks[i]);
+  }
+
+  // 3) table 블록 → table 슬롯 1:1 (동일 규칙)
+  const tableOverflow: Block[] = [];
+  tableSlots.forEach((slot, idx) => {
+    const block = tableBlocks[idx];
+    slotBlockRefs[slot.id] = block ? [block.id] : [];
+  });
+  for (let i = tableSlots.length; i < tableBlocks.length; i++) {
+    tableOverflow.push(tableBlocks[i]);
+  }
+
+  // 4) 호환 안 되는 블록 처리 — 누락 회피 정책 (M3b-3 P11 → M3b-5 1단계 유지)
+  //    image 슬롯 없는데 image 블록 있음, table 슬롯 없는데 table 블록 있음, chart/shape 등.
+  //    모두 첫 text 슬롯에 박음. text 슬롯도 없는 케이스(예: full-image)는 누락 OK
+  //    (BLOCK_ORPHANED 검증에서 잡혀 사용자에게 retry 안내).
+  const overflowAll: Block[] = [
+    ...(imageSlots.length === 0 ? imageBlocks : imageOverflow),
+    ...(tableSlots.length === 0 ? tableBlocks : tableOverflow),
+    ...otherBlocks,
+  ];
+  if (overflowAll.length > 0 && textSlots.length > 0) {
+    const firstTextSlot = textSlots[0];
+    const existing = slotBlockRefs[firstTextSlot.id] ?? [];
+    slotBlockRefs[firstTextSlot.id] = [
+      ...existing,
+      ...overflowAll.map((b) => b.id),
+    ];
+  }
+
+  // 5) 빈 슬롯 정리 — optional 인 빈 슬롯은 hiddenSlotIds 로, 키는 제거
+  for (const slot of pattern.slots) {
+    const blockIds = slotBlockRefs[slot.id] ?? [];
+    if (blockIds.length === 0) {
+      if (slot.optional) {
+        hiddenSlotIds.push(slot.id);
+        delete slotBlockRefs[slot.id];
+      } else {
+        // 필수 슬롯인데 박을 블록이 없음 — 검증에서 SLOT_MISMATCH 로 잡힘
+        // (예: halves-text-image 인데 image 블록 0개. retry 가 다른 콤포지션 선택 유도)
+        // 빈 배열을 그대로 유지해 검증이 정확히 잡도록.
+        slotBlockRefs[slot.id] = [];
+      }
+    }
+  }
+
+  return { slotBlockRefs, hiddenSlotIds };
+}
+
+/**
+ * 배열을 n 개의 청크로 균등 분할 — 순서 보존.
+ *
+ * 잔여 항목은 마지막 청크에 몰아넣음.
+ *   chunkEvenly([a,b,c,d], 2) → [[a,b], [c,d]]
+ *   chunkEvenly([a,b,c,d,e], 2) → [[a,b], [c,d,e]]
+ *   chunkEvenly([a,b,c], 2) → [[a], [b,c]]
+ *   chunkEvenly([a], 2) → [[a], []]
+ *   chunkEvenly([], 2) → [[], []]
+ *   chunkEvenly([a,b,c], 0) → []  (n=0 가드)
+ *   chunkEvenly([a,b,c], 1) → [[a,b,c]]
+ */
+function chunkEvenly<T>(items: T[], n: number): T[][] {
+  if (n <= 0) return [];
+  if (n === 1) return [items];
+  const chunks: T[][] = [];
+  const baseSize = Math.floor(items.length / n);
+  for (let i = 0; i < n; i++) {
+    const start = i * baseSize;
+    // 마지막 청크: 남은 거 다 가져감
+    const end = i === n - 1 ? items.length : start + baseSize;
+    chunks.push(items.slice(start, end));
+  }
+  return chunks;
 }
 
 // ─────────────────────────────────────────────────────────────
