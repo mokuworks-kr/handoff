@@ -183,7 +183,13 @@ export async function paginateBook(input: PaginateInput): Promise<PaginateOutput
 
     // ── 5.5 sectionIds → slotBlockRefs 자동 매핑 (M3b-3 P10) ────
     try {
-      expandSectionIdsToSlots(llmBook, input.manuscript, input.patterns);
+      expandSectionIdsToSlots(
+        llmBook,
+        input.manuscript,
+        input.patterns,
+        input.format,
+        input.designTokens,
+      );
     } catch (e) {
       if (e instanceof PaginateError) throw e;
       throw new PaginateError(
@@ -428,31 +434,69 @@ function expandSectionIdsToSlots(
   book: LlmBookOutput,
   manuscript: PaginateInput["manuscript"],
   patterns: readonly CompositionPattern[],
+  format: PaginateInput["format"],
+  designTokens: PaginateInput["designTokens"],
 ): void {
   const sectionMap = new Map(manuscript.sections.map((s) => [s.id, s]));
   const patternMap = new Map(patterns.map((p) => [p.slug, p]));
 
-  for (const page of book.pages) {
-    const pattern = patternMap.get(page.pattern);
-    if (!pattern) {
-      // 검증에서 PATTERN_NOT_FOUND 로 잡힘 — 여기서는 그냥 빈 매핑 박고 넘어감
-      page.slotBlockRefs = {};
-      continue;
-    }
+  // 본문 폰트 크기 한 번 미리 뽑기 — 모든 페이지 룰에 같은 값 사용.
+  // body 라는 이름의 paragraph style 이 없으면 첫 paragraph style 의 fontSize, 그것도 없으면 10.5pt.
+  // (10.5pt 는 default.md 본문 기본값 — 다른 DESIGN.md 에서 paragraph style 누락된 비상시 fallback)
+  const bodyFontSizePt = findBodyFontSizePt(designTokens);
 
-    // sectionIds 에 박힌 ID 들의 블록을 순서대로 모음
+  for (const page of book.pages) {
+    // sectionIds 에 박힌 ID 들의 블록을 순서대로 모음 — 룰에도 필요, 분배에도 필요
     const collectedBlocks: Block[] = [];
     for (const sectionId of page.sectionIds ?? []) {
       const section = sectionMap.get(sectionId);
-      if (!section) {
-        // 검증에서 잡힘 — 빈 매핑 그대로
-        continue;
-      }
+      if (!section) continue;
       const sectionBlocks = blocksInSection(manuscript.blocks, section);
-      // separator 자동 제외
       for (const b of sectionBlocks) {
         if (b.type !== "separator") collectedBlocks.push(b);
       }
+    }
+
+    // ── 룰 적용 (M3b-5 2단계, 2026-05) — LLM 의 page.pattern 을 룰 추천으로 덮어씀 ──
+    //
+    // 왜 박혀있나:
+    //   Gemini Flash 가 콤포지션 선택을 안전한 단일 슬롯(full-text)으로 도피하는
+    //   패턴이 일관되게 발견됨. retry-with-feedback 으로도 해결 안 됨 (오히려 retry 가
+    //   다양성 죽이는 방향으로 작동). LLM 우회 한계 인정 후, 콤포지션 선택만
+    //   룰 기반으로 이양 — AI + 룰 하이브리드 (진행 문서 §10 fallback).
+    //
+    // 사용자 시점에선 변경 0:
+    //   "딸깍 → 다양한 결과" (§1 차별화 4축 1번) 그대로. DESIGN.md 시스템 그대로.
+    //   다른 DESIGN.md 만들면 다른 카탈로그 → 다른 결과. 룰은 모든 DESIGN.md 호환.
+    //
+    // LLM 책임 영역 그대로 유지:
+    //   - 페이지 분할 (어느 섹션이 어느 페이지에)
+    //   - sectionIds 분배
+    //   - role 결정 (cover/body 등)
+    //   - splitReason / rationale 같은 메타
+    //
+    // 룰 책임:
+    //   - 각 페이지의 콤포지션 슬러그만 결정
+    const recommended = recommendCompositionForPage({
+      pageRole: page.role,
+      blocks: collectedBlocks,
+      availableSlugs: patterns.map((p) => p.slug),
+      pageWidthMm: format.width,
+      marginInsideMm: format.margins.inside,
+      marginOutsideMm: format.margins.outside,
+      gutterMm: format.gutter,
+      bodyFontSizePt,
+    });
+
+    // LLM 출력 덮어쓰기 — 룰 추천이 최종 슬러그
+    page.pattern = recommended.slug;
+
+    const pattern = patternMap.get(page.pattern);
+    if (!pattern) {
+      // 검증에서 PATTERN_NOT_FOUND 로 잡힘 — 여기서는 그냥 빈 매핑 박고 넘어감.
+      // 룰이 availableSlugs 안에서만 골랐으니 정상 흐름에선 도달 안 함.
+      page.slotBlockRefs = {};
+      continue;
     }
 
     // 슬롯 분배 — 단일 vs 다중 분기 (M3b-5 1단계: 다중 부활)
@@ -466,6 +510,256 @@ function expandSectionIdsToSlots(
     }
   }
 }
+
+/**
+ * 본문 폰트 크기 찾기 — DesignTokens.print.paragraphStyles 에서 id="body" 를 찾고,
+ * 없으면 첫 단락 스타일의 fontSize, 그것도 없으면 default.md 기본값 10.5pt.
+ *
+ * 다른 DESIGN.md 가 본문 ID 를 다르게 박아도 안전한 fallback.
+ */
+function findBodyFontSizePt(designTokens: PaginateInput["designTokens"]): number {
+  const styles = designTokens.print?.paragraphStyles ?? [];
+  const body = styles.find((s) => s.id === "body");
+  if (body && typeof body.fontSize === "number") return body.fontSize;
+  const first = styles[0];
+  if (first && typeof first.fontSize === "number") return first.fontSize;
+  return 10.5; // default.md 기본값
+}
+
+// ─────────────────────────────────────────────────────────────
+// 콤포지션 추천 룰 (M3b-5 2단계, 2026-05) — AI + 룰 하이브리드
+// ─────────────────────────────────────────────────────────────
+
+type RecommendInput = {
+  /** LLM 이 결정한 페이지 역할 (cover/body/...) — 표지는 강제 풀폭 */
+  pageRole: string;
+  /** 이 페이지에 들어갈 모든 비-separator 블록 */
+  blocks: Block[];
+  /** 카탈로그 안의 활성 슬러그 — 룰은 이 안에서만 추천 */
+  availableSlugs: string[];
+  /** 페이지 너비 (mm) */
+  pageWidthMm: number;
+  /** 안쪽 여백 (mm) — 제본 쪽 */
+  marginInsideMm: number;
+  /** 바깥 여백 (mm) */
+  marginOutsideMm: number;
+  /** 컬럼 사이 간격 (mm) */
+  gutterMm: number;
+  /** 본문 폰트 크기 (pt) */
+  bodyFontSizePt: number;
+};
+
+type RecommendResult = {
+  slug: string;
+  /** 디버깅용 자연어 메모 — LLM 출력의 rationale 와는 별개, 룰의 결정 이유 */
+  reason: string;
+};
+
+// 가독성 임계값 (M3b-5 2단계 초기값, 검증 후 조정 예정).
+//
+// MAX_CHARS_PER_LINE_FULLWIDTH:
+//   풀폭 한 줄이 이 글자 수 넘으면 "너무 길다 → 좌우 분할이 가독성 ↑".
+//   출판/조판 정설: 한글 한 줄 25~40자가 편한 너비 (사용자 짚은 7~12어절 기준).
+//   40자는 그 상한 — 그 이상이면 좌우 두 단이 가독성 더 좋음.
+//
+// MIN_CHARS_FOR_HALVES:
+//   글자 양이 이 미만이면 좌우 분할 시 한 컬럼이 거의 빈 채로 남음 → 풀폭이 시원.
+//   200자는 한 페이지의 1/3쯤 — 그 미만은 좌우 분할이 부자연스러움.
+const MAX_CHARS_PER_LINE_FULLWIDTH = 40;
+const MIN_CHARS_FOR_HALVES = 200;
+
+// 한글 1글자 평균 너비 = 폰트 크기 × 0.5 (대략).
+// pt → mm 환산: 1pt = 0.3528mm. 한글은 정사각형 글자라 너비 ≈ 폰트 크기.
+// 추정값 — 실제 렌더링 너비는 폰트별 다름. 검증 후 조정.
+const KOREAN_CHAR_WIDTH_RATIO = 0.5;
+const PT_TO_MM = 0.3528;
+
+/**
+ * 한 페이지에 적합한 콤포지션 슬러그 추천.
+ *
+ * 결정 흐름 (위에서 아래로, 첫 매치 사용):
+ *   룰 1) role=cover → "full-text" (표지는 풀폭 정상)
+ *   룰 2) 블록 종류 통계 계산 (image/table/text 카운트)
+ *   룰 3) 이미지 위주 페이지 (image 4+, text<=2 → quarters / image 3 → thirds / image 1+ + text → halves)
+ *   룰 4) 표가 있는 페이지 (wide-narrow-table-text 우선, 봉인 시 풀폭 — 표는 좁은 컬럼에 깨짐)
+ *   룰 5) 텍스트 + 이미지 혼합 (wide-narrow-text-image 우선 → halves-text-image)
+ *   룰 6) 글만 있는 페이지 — 가독성 기준
+ *         (글 200자+ 이고 한 줄이 40자+ 가독성 나쁨 → 좌우 분할)
+ *         (또는 제목 2개+ → 비교 구조 → 좌우 분할)
+ *   룰 7) fallback: full-text
+ *
+ * 모든 추천은 availableSlugs 안에서만 — 어휘 봉인 상태에서도 안전.
+ * 추천 콤포지션이 활성 안 되어있으면 다음 차선책 fallback.
+ *
+ * 결정론적: LLM 호출 0, 같은 입력 → 항상 같은 출력.
+ */
+function recommendCompositionForPage(input: RecommendInput): RecommendResult {
+  const { pageRole, blocks, availableSlugs } = input;
+
+  // ── 룰 1: 표지는 풀폭 ──
+  if (pageRole === "cover") {
+    return pickAvailable(["full-text"], availableSlugs, "표지 — 풀폭 정상");
+  }
+
+  // ── 룰 2: 블록 종류 통계 ──
+  const stats = countBlockKinds(blocks);
+
+  // ── 룰 3: 이미지 위주 ──
+  if (stats.image >= 4 && stats.text <= 2) {
+    return pickAvailable(
+      [
+        "quarters-image-image-image-image",
+        "halves-text-image",
+        "full-text",
+      ],
+      availableSlugs,
+      `이미지 ${stats.image}개 위주 — 4분할 우선`,
+    );
+  }
+  if (stats.image >= 3 && stats.text <= 2) {
+    return pickAvailable(
+      ["thirds-image-image-image", "halves-text-image", "full-text"],
+      availableSlugs,
+      `이미지 ${stats.image}개 — 3분할 우선`,
+    );
+  }
+
+  // ── 룰 4: 표가 있는 페이지 ──
+  // 표는 wide-narrow-table-text 가 정상 (큰 표 + 짧은 캡션).
+  // 봉인 상태에선 fallback "풀폭" — 표는 좁은 컬럼 들어가면 깨짐 (사용자 결정 b).
+  if (stats.table >= 1) {
+    return pickAvailable(
+      ["wide-narrow-table-text", "full-text"],
+      availableSlugs,
+      `표 ${stats.table}개 — wide-narrow 우선, 없으면 풀폭 (좁은 컬럼은 표 가독성 ↓)`,
+    );
+  }
+
+  // ── 룰 5: 텍스트 + 이미지 혼합 ──
+  if (stats.image >= 1 && stats.text >= 1) {
+    return pickAvailable(
+      ["wide-narrow-text-image", "halves-text-image", "full-text"],
+      availableSlugs,
+      `이미지 ${stats.image}개 + 텍스트 ${stats.text}개 — wide-narrow 우선`,
+    );
+  }
+
+  // ── 룰 6: 글만 있는 페이지 — 가독성 기준 ──
+  if (stats.text >= 1 && stats.image === 0 && stats.table === 0) {
+    // 풀폭 한 줄에 들어갈 글자 수 추정 — 페이지 너비, 여백, 폰트 크기 보고.
+    // 한글 1글자 너비 ≈ 폰트 크기 (mm 환산 후) × 비율.
+    const bodyWidthMm =
+      input.pageWidthMm - input.marginInsideMm - input.marginOutsideMm;
+    const charWidthMm =
+      input.bodyFontSizePt * PT_TO_MM * KOREAN_CHAR_WIDTH_RATIO;
+    const charsPerLineFullWidth = Math.floor(bodyWidthMm / charWidthMm);
+
+    // 가독성 판정: 한 줄이 너무 길면 좌우 분할
+    const fullWidthTooWide = charsPerLineFullWidth > MAX_CHARS_PER_LINE_FULLWIDTH;
+
+    // 글자 양 판정: 너무 적으면 좌우 분할 시 빈 컬럼 위험
+    const totalChars = countTotalChars(blocks);
+    const enoughCharsForHalves = totalChars >= MIN_CHARS_FOR_HALVES;
+
+    // 비교 구조 판정: 제목 2개+ 면 비교 구조 → 좌우 분할 자연
+    const headingCount = blocks.filter((b) => b.type === "heading").length;
+    const isComparisonStructure = headingCount >= 2;
+
+    // 최종: (가독성 나쁨 AND 글자 충분) OR 비교 구조 → 좌우 분할
+    const shouldHalve =
+      (fullWidthTooWide && enoughCharsForHalves) || isComparisonStructure;
+
+    if (shouldHalve) {
+      return pickAvailable(
+        ["halves-text-text", "full-text"],
+        availableSlugs,
+        `글만 — 좌우 분할 (한 줄 ${charsPerLineFullWidth}자, 글자 ${totalChars}자, 제목 ${headingCount}개)`,
+      );
+    }
+    return pickAvailable(
+      ["full-text"],
+      availableSlugs,
+      `글만 — 풀폭 (한 줄 ${charsPerLineFullWidth}자, 글자 ${totalChars}자, 제목 ${headingCount}개)`,
+    );
+  }
+
+  // ── 룰 7: fallback ──
+  return pickAvailable(["full-text"], availableSlugs, "fallback");
+}
+
+/**
+ * 우선순위 슬러그 목록에서 availableSlugs 안의 첫 매치 반환.
+ * 다 못 찾으면 마지막 보루 "full-text" — 모든 카탈로그에 항상 있다고 가정.
+ */
+function pickAvailable(
+  preferences: string[],
+  availableSlugs: string[],
+  baseReason: string,
+): RecommendResult {
+  const set = new Set(availableSlugs);
+  for (const slug of preferences) {
+    if (set.has(slug)) {
+      return { slug, reason: baseReason };
+    }
+  }
+  // 모든 우선순위가 봉인 — 활성 카탈로그 첫 슬러그로 fallback (정상 흐름엔 도달 안 함)
+  return {
+    slug: availableSlugs[0] ?? "full-text",
+    reason: `${baseReason} (모든 우선순위 봉인 → fallback)`,
+  };
+}
+
+/**
+ * 블록들의 종류별 카운트.
+ * heading/paragraph/list 는 모두 "text" 로 묶음 (단락 스타일 차이지 콘텐츠 구조 차이 아님).
+ */
+function countBlockKinds(blocks: Block[]): {
+  text: number;
+  image: number;
+  table: number;
+  other: number;
+} {
+  let text = 0,
+    image = 0,
+    table = 0,
+    other = 0;
+  for (const b of blocks) {
+    if (b.type === "heading" || b.type === "paragraph" || b.type === "list") text++;
+    else if (b.type === "image") image++;
+    else if (b.type === "table") table++;
+    else other++;
+  }
+  return { text, image, table, other };
+}
+
+/**
+ * 블록들의 총 글자 수 — 가독성 판정용.
+ * heading/paragraph/list 의 텍스트 모두 합산.
+ *
+ * Block 의 텍스트는 runs: TextRun[] 형태로 박혀있어 (lib/parsers/normalized.ts).
+ * runs 의 각 run 의 text 필드를 합쳐서 글자 수 계산.
+ *
+ * 정확한 글자 수 — list 도 포함해서 계산 (item 들의 runs 도 합산).
+ */
+function countTotalChars(blocks: Block[]): number {
+  let total = 0;
+  for (const b of blocks) {
+    if (b.type === "heading" || b.type === "paragraph") {
+      for (const run of b.runs) {
+        // 공백 제외 — 가독성 판정 기준
+        total += run.text.replace(/\s+/g, "").length;
+      }
+    } else if (b.type === "list") {
+      for (const item of b.items) {
+        for (const run of item.runs) {
+          total += run.text.replace(/\s+/g, "").length;
+        }
+      }
+    }
+  }
+  return total;
+}
+
 
 /**
  * 콤포지션의 슬롯들에 블록들을 분배.
