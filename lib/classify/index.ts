@@ -71,9 +71,32 @@ export async function classifyManuscript(
     normalized.blocks,
   );
 
+  // 후처리: 섹션 경계 밖 블록(orphan)을 인접 섹션에 흡수.
+  //
+  // 왜 박혀있나 (M3b-5 1단계 후속, 2026-05):
+  //   분류기 LLM(Gemini Flash) 이 페이지 끝에 박혀있는 image 블록을
+  //   일관되게 섹션 경계 밖으로 밀어내는 패턴이 발견됨 (엘라인 pptx 시드:
+  //   23개 image 중 23개가 섹션 어디에도 안 속함 → 페이지네이션 단계에서
+  //   BLOCK_ORPHANED 23건 발생).
+  //
+  //   page-separator 직전 위치의 image 가 LLM 한테 "구조 외 콘텐츠"
+  //   처럼 보이는 듯 (분류 작업 본질이 의미 단위 묶기라 image 같은
+  //   비-텍스트 블록의 처리가 약함).
+  //
+  //   근본은 분류기 LLM 한계지만, 결정론적 코드 후처리로 안전하게 보정.
+  //   (분류기 시스템 프롬프트 강화는 효과 불확실 — Gemini Flash 의
+  //   instruction following 한계 같음.)
+  //
+  // 흡수 정책: 직전 섹션의 toBlockId 확장 (사용자 결정).
+  //   페이지 끝 image 가 그 페이지 마지막 콘텐츠로 묶이는 구조라 자연스러움.
+  const sectionsWithOrphansAbsorbed = absorbOrphanBlocks(
+    sections,
+    normalized.blocks,
+  );
+
   return {
     ...normalized,
-    sections,
+    sections: sectionsWithOrphansAbsorbed,
     classification: {
       model: result.model,
       inputTokens: result.usage.inputTokens,
@@ -388,4 +411,147 @@ function sanitizeHints(raw: Record<string, unknown>): Section["hints"] {
   if (typeof raw.hasTitle === "boolean") out.hasTitle = raw.hasTitle;
   if (typeof raw.totalCharCount === "number") out.totalCharCount = raw.totalCharCount;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// ─────────────────────────────────────────────────────────────
+// orphan 블록 흡수 (M3b-5 1단계 후속, 2026-05)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 섹션 경계 밖 블록(orphan)을 인접 섹션에 흡수.
+ *
+ * orphan = 비-separator 블록 중 어떤 섹션의 [fromBlockId, toBlockId]
+ *          범위에도 속하지 않은 블록.
+ *
+ * 흡수 규칙:
+ *   - 직전 섹션이 있으면: 그 섹션의 toBlockId 를 orphan 까지 확장
+ *   - 직전 섹션이 없으면 (orphan 이 첫 섹션 이전): 첫 섹션의 fromBlockId 를
+ *     orphan 까지 앞으로 확장
+ *   - 섹션이 0개면: 흡수 불가, 그대로 반환
+ *   - separator 블록은 흡수 안 함 (페이지 분할 신호, 섹션 외부가 정상)
+ *
+ * 부수 효과:
+ *   흡수한 섹션의 hints 갱신 — orphan 이 image 면 hints.hasImage=true,
+ *   table 이면 hints.hasTable=true. 페이지네이션 LLM 이 hints 보고
+ *   콤포지션 결정에 영향 줄 수 있어 갱신하는 게 정직.
+ *
+ * 결정론적: LLM 호출 0, 외부 의존 0. 같은 입력엔 항상 같은 출력.
+ *
+ * 비파괴적: 입력 sections / blocks 는 안 건드림. 새 Section[] 반환.
+ */
+function absorbOrphanBlocks(
+  sections: Section[],
+  blocks: Block[],
+): Section[] {
+  // 섹션이 0개면 흡수 불가 — 분류기가 통째로 실패한 케이스, 그대로 반환
+  if (sections.length === 0) return sections;
+
+  // 블록 ID → 인덱스 맵
+  const idToIndex = new Map<string, number>();
+  blocks.forEach((b, i) => idToIndex.set(b.id, i));
+
+  // 섹션을 fromIdx 순으로 가공 — 입력은 이미 정렬돼있다고 가정 (validateAndNormalizeSections 산출물)
+  // 안전 위해 한 번 더 정렬
+  const indexed = sections
+    .map((s) => ({
+      section: s,
+      fromIdx: idToIndex.get(s.fromBlockId) ?? -1,
+      toIdx: idToIndex.get(s.toBlockId) ?? -1,
+    }))
+    .filter((s) => s.fromIdx !== -1 && s.toIdx !== -1)
+    .sort((a, b) => a.fromIdx - b.fromIdx);
+
+  if (indexed.length === 0) return sections;
+
+  // orphan 식별 — 비-separator 이면서 어떤 섹션 범위에도 안 속하는 블록
+  const orphanIndices: number[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    if (block.type === "separator") continue;
+
+    const inSomeSection = indexed.some((s) => s.fromIdx <= i && i <= s.toIdx);
+    if (!inSomeSection) orphanIndices.push(i);
+  }
+
+  if (orphanIndices.length === 0) return sections;
+
+  // 각 orphan 에 대해 흡수 대상 섹션 결정
+  // 정책: 직전 섹션 우선. 직전 섹션 없으면 (= orphan 이 첫 섹션 이전) 첫 섹션에 흡수.
+  // 같은 섹션에 여러 orphan 흡수되면 toIdx 를 가장 뒤 orphan 까지 한 번에 확장.
+  //
+  // 단, 흡수 시 다음 섹션의 fromIdx 는 침범하면 안 됨 — 정렬돼있으니
+  // 직전 섹션의 새 toIdx 가 다음 섹션 fromIdx 와 겹칠 수 없음 (orphan 정의상 그 사이에 있음).
+
+  // sectionIdx → 흡수할 orphan 들의 idx 목록
+  const absorbMap = new Map<number, number[]>();
+
+  for (const oIdx of orphanIndices) {
+    // 직전 섹션 찾기 — fromIdx <= oIdx 인 섹션 중 가장 뒤
+    let prevSectionIdx = -1;
+    for (let i = indexed.length - 1; i >= 0; i--) {
+      if (indexed[i].toIdx < oIdx) {
+        prevSectionIdx = i;
+        break;
+      }
+    }
+
+    // 직전 섹션 없으면 (orphan 이 첫 섹션의 fromIdx 보다 앞) → 첫 섹션에 흡수 (앞으로 확장)
+    const targetIdx = prevSectionIdx === -1 ? 0 : prevSectionIdx;
+    const list = absorbMap.get(targetIdx) ?? [];
+    list.push(oIdx);
+    absorbMap.set(targetIdx, list);
+  }
+
+  // 흡수 적용 — 새 Section 배열 반환
+  return indexed.map((entry, sectionIdx) => {
+    const toAbsorb = absorbMap.get(sectionIdx);
+    if (!toAbsorb || toAbsorb.length === 0) return entry.section;
+
+    // 흡수할 orphan 들의 idx 정렬
+    toAbsorb.sort((a, b) => a - b);
+    const minOrphanIdx = toAbsorb[0];
+    const maxOrphanIdx = toAbsorb[toAbsorb.length - 1];
+
+    // 새 from/toBlockId 결정
+    // - 첫 섹션에 흡수 (앞 확장): minOrphanIdx 가 fromIdx 보다 작으면 fromBlockId 를 minOrphanIdx 의 블록 ID 로
+    // - 직전 섹션에 흡수 (뒤 확장): maxOrphanIdx 가 toIdx 보다 크면 toBlockId 를 maxOrphanIdx 의 블록 ID 로
+    let newFromBlockId = entry.section.fromBlockId;
+    let newToBlockId = entry.section.toBlockId;
+
+    if (minOrphanIdx < entry.fromIdx) {
+      newFromBlockId = blocks[minOrphanIdx].id;
+    }
+    if (maxOrphanIdx > entry.toIdx) {
+      newToBlockId = blocks[maxOrphanIdx].id;
+    }
+
+    // hints 갱신 — 흡수된 orphan 종류 보고 hasImage / hasTable 켜기
+    const existingHints = entry.section.hints ?? {};
+    let mergedHints: NonNullable<Section["hints"]> = { ...existingHints };
+    let hintsChanged = false;
+    for (const oIdx of toAbsorb) {
+      const orphanBlock = blocks[oIdx];
+      if (orphanBlock.type === "image" && !mergedHints.hasImage) {
+        mergedHints.hasImage = true;
+        hintsChanged = true;
+      }
+      if (orphanBlock.type === "table" && !mergedHints.hasTable) {
+        mergedHints.hasTable = true;
+        hintsChanged = true;
+      }
+    }
+
+    const newSection: Section = {
+      ...entry.section,
+      fromBlockId: newFromBlockId,
+      toBlockId: newToBlockId,
+    };
+    if (hintsChanged) {
+      newSection.hints = mergedHints;
+    } else if (entry.section.hints) {
+      newSection.hints = entry.section.hints;
+    }
+
+    return newSection;
+  });
 }
